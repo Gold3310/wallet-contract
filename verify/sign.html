@@ -113,12 +113,16 @@ Verification token 8cb9f47a53ebf75efb3b3aa2beb9d381315f72d0</pre>
         <button id="signBtn" class="secondary" disabled>2. Sign message</button>
         <button id="copySigBtn" class="secondary" disabled>Copy signature</button>
       </div>
-      <div class="status" id="walletStatus">Not connected yet.</div>
+      <div class="status" id="walletStatus">Detecting Rabby…</div>
     </div>
 
     <div class="card">
       <h2>Address</h2>
       <input id="addressInput" placeholder="Connected address will fill in automatically" />
+      <p class="muted" style="font-size:.82rem">
+        The address is filled in automatically after Rabby is connected. If it does not match
+        the account you are verifying, do not sign.
+      </p>
     </div>
 
     <div class="card">
@@ -226,6 +230,9 @@ Verification token 8cb9f47a53ebf75efb3b3aa2beb9d381315f72d0</pre>
         if (ok) {
           verifyStatus.innerHTML = "<span class='ok'>VERIFIED ✓</span> — recovered signer matches: <code>" + recovered + "</code>";
           copySigBtn.disabled = false;
+          // Safe convenience: copy the verified signature immediately. We do
+          // not auto-sign, broadcast, or submit it anywhere.
+          copyToClipboard();
         } else {
           verifyStatus.innerHTML = "<span class='bad'>NOT VERIFIED ✗</span> — recovered <code>" + recovered + "</code> does not match <code>" + address + "</code>.";
         }
@@ -243,20 +250,45 @@ Verification token 8cb9f47a53ebf75efb3b3aa2beb9d381315f72d0</pre>
           addressInput.value = account;
           walletStatus.innerHTML = "Connected: <code>" + account + "</code>";
           signBtn.disabled = false;
+        } else {
+          walletStatus.textContent = "Rabby detected — click Connect to authorize an account.";
         }
       } catch (_) {}
     }
 
-    connectBtn.addEventListener("click", connectProfile);
-    signBtn.addEventListener("click", signMessage);
-    copySigBtn.addEventListener("click", async () => {
+    async function autoConnect() {
+      if (!await ensureEthereum()) return;
+      // This is still gated by Rabby's own approval UI. We never bypass the
+      // wallet prompt: eth_requestAccounts shows Rabby's account chooser, and
+      // signing still requires a second explicit approval in Rabby.
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+        if (accounts && accounts.length) {
+          account = accounts[0];
+          addressInput.value = account;
+          walletStatus.innerHTML = "Connected: <code>" + account + "</code> (auto-connected)";
+          signBtn.disabled = false;
+        }
+      } catch (_) {
+        walletStatus.textContent = "Rabby detected but not authorized yet. Click Connect to continue.";
+      }
+    }
+
+    async function copyToClipboard() {
       try {
         await navigator.clipboard.writeText(signatureInput.value);
         copySigBtn.textContent = "Copied!";
         setTimeout(() => (copySigBtn.textContent = "Copy signature"), 1500);
       } catch (_) {}
-    });
+    }
 
+    connectBtn.addEventListener("click", connectProfile);
+    signBtn.addEventListener("click", signMessage);
+    copySigBtn.addEventListener("click", copyToClipboard);
+
+    // Safe convenience: auto-connect Rabby on page load (still needs Rabby's
+    // approval). We do NOT auto-sign or auto-broadcast anything.
+    setTimeout(autoConnect, 400);
     recheckIfConnected();
   </script>
 </body>
