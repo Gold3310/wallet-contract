@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dextools Verify — Sign in Rabby</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1f232d;
+    --text: #e7ebf3;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --ok: #34c77b;
+    --bad: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  main { width: min(760px, 100%); }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; line-height: 1.5; }
+  .card {
+    background: var(--panel);
+    border: 1px solid #262b36;
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 18px;
+  }
+  h2 { font-size: 0.95rem; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  pre.message {
+    background: var(--panel-2);
+    border: 1px solid #2a3040;
+    border-radius: 8px;
+    padding: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.9rem;
+    margin: 0 0 14px;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    font: inherit;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 10px;
+    padding: 12px 18px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid #2a3040; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: 14px 0 4px; }
+  input, textarea {
+    width: 100%;
+    font: inherit;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid #2a3040;
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  textarea { min-height: 88px; resize: vertical; }
+  .status { margin-top: 12px; font-size: .9rem; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  code { word-break: break-all; font-size: .78rem; }
+  .warn {
+    border: 1px solid #8a6d1a;
+    background: #241d0d;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: .85rem;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Dextools verification — sign &amp; approve</h1>
+    <p class="sub">
+      This page runs locally in your browser. It asks <strong>Rabby</strong> to sign the
+      exact Dextools message below, then verifies the resulting signature locally against
+      your address with <code>ethers</code>. Your private key never leaves Rabby.
+    </p>
+
+    <div class="card">
+      <h2>Message to sign</h2>
+      <pre class="message" id="message">Verify your account in Dextools.io
+Verification token 8cb9f47a53ebf75efb3b3aa2beb9d381315f72d0</pre>
+      <label for="messageInput">Message (editable only if the wallet prompt shows different text)</label>
+      <textarea id="messageInput"></textarea>
+      <p class="muted" style="font-size:.82rem">
+        If the prompt shown by Rabby differs from this text, do <strong>not</strong> sign — verify
+        the site and the prompt first.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Wallet</h2>
+      <div class="row">
+        <button id="connectBtn">1. Connect Rabby</button>
+        <button id="signBtn" class="secondary" disabled>2. Sign message</button>
+        <button id="copySigBtn" class="secondary" disabled>Copy signature</button>
+      </div>
+      <div class="status" id="walletStatus">Not connected yet.</div>
+    </div>
+
+    <div class="card">
+      <h2>Address</h2>
+      <input id="addressInput" placeholder="Connected address will fill in automatically" />
+    </div>
+
+    <div class="card">
+      <h2>Signature</h2>
+      <textarea id="signatureInput" placeholder="0x... (will fill in after signing)"></textarea>
+      <div class="status" id="verifyStatus"></div>
+    </div>
+
+    <div class="card warn">
+      <strong>Security reminder:</strong> this is an <em>ownership</em> signature, not a
+      transaction. It should be free and should not request any token allowance or funds.
+      Only sign from the real <strong>dextools.io</strong>, and never share your seed phrase,
+      private key, or backup phrase with anyone.
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+  <script>
+    const DEFAULT_MESSAGE = [
+      "Verify your account in Dextools.io",
+      "Verification token 8cb9f47a53ebf75efb3b3aa2beb9d381315f72d0",
+    ].join("\n");
+
+    let account = null;
+
+    const $ = (id) => document.getElementById(id);
+    const messageOut = $("message");
+    const messageInput = $("messageInput");
+    const addressInput = $("addressInput");
+    const signatureInput = $("signatureInput");
+    const connectBtn = $("connectBtn");
+    const signBtn = $("signBtn");
+    const copySigBtn = $("copySigBtn");
+    const walletStatus = $("walletStatus");
+    const verifyStatus = $("verifyStatus");
+
+    messageInput.value = DEFAULT_MESSAGE;
+    messageInput.addEventListener("input", () => {
+      messageOut.textContent = messageInput.value || "(empty)";
+      verifyStatus.textContent = "";
+    });
+
+    async function ensureEthereum() {
+      if (!window.ethereum) {
+        walletStatus.textContent = "No browser wallet detected. Please open this page in a browser with the Rabby extension installed.";
+        return false;
+      }
+      return true;
+    }
+
+    async function getAccounts() {
+      if (!await ensureEthereum()) return null;
+      const accounts = await window.ethereum.request({ method: "eth_accounts" });
+      return accounts;
+    }
+
+    async function connectProfile() {
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+        if (!accounts || !accounts.length) {
+          walletStatus.textContent = "No account authorized in Rabby.";
+          return;
+        }
+        account = accounts[0];
+        addressInput.value = account;
+        walletStatus.innerHTML = "Connected: <code>" + account + "</code>";
+        signBtn.disabled = false;
+      } catch (err) {
+        walletStatus.textContent = "Connection was rejected or failed: " + (err && err.message ? err.message : err);
+      }
+    }
+
+    async function signMessage() {
+      if (!account) {
+        verifyStatus.textContent = "Connect your wallet first.";
+        return;
+      }
+      const message = messageInput.value;
+      if (message !== DEFAULT_MESSAGE) {
+        // Still allow it, but warn.
+        console.warn("Signing a non-default message.");
+      }
+      try {
+        signBtn.disabled = true;
+        signBtn.textContent = "Waiting for Rabby…";
+        const signature = await window.ethereum.request({
+          method: "personal_sign",
+          params: [message, account],
+        });
+        signatureInput.value = signature;
+        verifyStatus.textContent = "Signature captured. Verifying locally…";
+        verifyMessageLocally(message, account, signature);
+      } catch (err) {
+        verifyStatus.textContent = "Signing was rejected or failed: " + (err && err.message ? err.message : err);
+      } finally {
+        signBtn.disabled = false;
+        signBtn.textContent = "2. Sign message";
+      }
+    }
+
+    function verifyMessageLocally(message, address, signature) {
+      try {
+        const recovered = ethers.verifyMessage(message, signature);
+        const ok = recovered.toLowerCase() === address.toLowerCase();
+        if (ok) {
+          verifyStatus.innerHTML = "<span class='ok'>VERIFIED ✓</span> — recovered signer matches: <code>" + recovered + "</code>";
+          copySigBtn.disabled = false;
+        } else {
+          verifyStatus.innerHTML = "<span class='bad'>NOT VERIFIED ✗</span> — recovered <code>" + recovered + "</code> does not match <code>" + address + "</code>.";
+        }
+      } catch (err) {
+        verifyStatus.textContent = "Could not verify signature: " + err.message;
+      }
+    }
+
+    async function recheckIfConnected() {
+      if (!await ensureEthereum()) return;
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        if (accounts && accounts.length) {
+          account = accounts[0];
+          addressInput.value = account;
+          walletStatus.innerHTML = "Connected: <code>" + account + "</code>";
+          signBtn.disabled = false;
+        }
+      } catch (_) {}
+    }
+
+    connectBtn.addEventListener("click", connectProfile);
+    signBtn.addEventListener("click", signMessage);
+    copySigBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(signatureInput.value);
+        copySigBtn.textContent = "Copied!";
+        setTimeout(() => (copySigBtn.textContent = "Copy signature"), 1500);
+      } catch (_) {}
+    });
+
+    recheckIfConnected();
+  </script>
+</body>
+</html>

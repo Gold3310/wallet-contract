@@ -1,0 +1,11 @@
+{
+  "name": "dextools-signature-verifier",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "node index.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.13.2"
+  }
+}
