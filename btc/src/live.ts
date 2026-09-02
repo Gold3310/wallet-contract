@@ -13,6 +13,9 @@
  *   3. broadcasts the split
  *   4. broadcasts one pre-signed withdrawal                          (NO key)
  *
+ * RECEIVER=tb1...  send to an address YOU control instead of a generated one.
+ *                  Recommended: then the coins stay spendable.
+ *
  * Set BROADCAST=0 to do everything except the two broadcasts.
  */
 import * as fs from 'fs';
@@ -95,9 +98,26 @@ async function main() {
   const feeRate = Math.max(1, Math.ceil((await api('/v1/fees/recommended')).halfHourFee ?? 1));
   console.log('fee rate ', feeRate, 'sat/vB');
 
-  // Receiver: a second throwaway address we control, so nothing is lost.
-  const receiverKey = ECPair.makeRandom({ network: NET });
-  const receiver = p2wpkhAddress(receiverKey, NET);
+  // Receiver. If you did not name one, generate it AND PERSIST ITS KEY --
+  // otherwise the coins would land at an address nobody can ever spend from.
+  let receiver: string;
+  if (process.env.RECEIVER) {
+    receiver = process.env.RECEIVER;
+    bitcoin.address.toOutputScript(receiver, NET); // throws if malformed
+  } else {
+    const saved = JSON.parse(fs.readFileSync(KEY_FILE, 'utf8'));
+    if (saved.receiverWif) {
+      receiver = p2wpkhAddress(ECPair.fromWIF(saved.receiverWif, NET), NET);
+    } else {
+      const receiverKey = ECPair.makeRandom({ network: NET });
+      receiver = p2wpkhAddress(receiverKey, NET);
+      fs.writeFileSync(
+        KEY_FILE,
+        JSON.stringify({ ...saved, receiverWif: receiverKey.toWIF() }, null, 2)
+      );
+      fs.chmodSync(KEY_FILE, 0o600);
+    }
+  }
 
   const vault: Vault = createVault({
     ownerKey: key,
@@ -113,7 +133,13 @@ async function main() {
   console.log('change     ', btc(vault.changeSats));
   const w = vault.withdrawals[0];
   const seen = inspectPresigned(w, 'testnet');
-  console.log('pre-signed ', btc(seen.amount), '->', seen.receiver);
+  console.log(
+    'pre-signed ',
+    btc(seen.amount),
+    '->',
+    seen.receiver,
+    process.env.RECEIVER ? '(yours)' : '(generated; key in .live-key.json)'
+  );
   console.log('  fee      ', w.feeSats, 'sat (pre-funded by the sender)');
   console.log('  signed   ', seen.fullySigned);
   console.log('  txid     ', w.txid);

@@ -14,6 +14,13 @@
  * If OWNER_PRIVATE_KEY is unset, a throwaway key is generated and saved to
  * .live-key.json (gitignored, chmod 600) and the script prints the address to
  * fund, then exits. Run it again once that address has testnet funds.
+ *
+ * RECEIVER=0x...  send the tokens to an address YOU control instead of a
+ *                 generated one. Recommended: then you can see them arrive.
+ *
+ * Every key this script generates -- operator, receiver, relayer -- is written
+ * to .live-key.json. Nothing that can hold value is ever discarded, and any
+ * unspent relayer gas is swept back to the owner at the end.
  */
 import { ethers } from 'ethers';
 import * as fs from 'fs';
@@ -43,20 +50,29 @@ async function send(label: string, txPromise: Promise<any>, confirmations: numbe
   return rcpt;
 }
 
+function readKeyFile(): any {
+  return fs.existsSync(KEY_FILE) ? JSON.parse(fs.readFileSync(KEY_FILE, 'utf8')) : {};
+}
+
+/** Persist anything that could hold value, so no testnet funds become stranded. */
+function saveKeys(patch: Record<string, unknown>) {
+  const merged = { ...readKeyFile(), ...patch };
+  fs.writeFileSync(KEY_FILE, JSON.stringify(merged, null, 2));
+  fs.chmodSync(KEY_FILE, 0o600);
+}
+
 function loadOrCreateKey(): { privateKey: string; address: string; generated: boolean } {
   if (process.env.OWNER_PRIVATE_KEY) {
     const w = new ethers.Wallet(process.env.OWNER_PRIVATE_KEY);
     return { privateKey: w.privateKey, address: w.address, generated: false };
   }
-  if (fs.existsSync(KEY_FILE)) {
-    const saved = JSON.parse(fs.readFileSync(KEY_FILE, 'utf8'));
-    return { ...saved, generated: false };
+  const saved = readKeyFile();
+  if (saved.privateKey) {
+    return { privateKey: saved.privateKey, address: saved.address, generated: false };
   }
   const w = ethers.Wallet.createRandom();
-  const rec = { privateKey: w.privateKey, address: w.address };
-  fs.writeFileSync(KEY_FILE, JSON.stringify(rec, null, 2));
-  fs.chmodSync(KEY_FILE, 0o600);
-  return { ...rec, generated: true };
+  saveKeys({ privateKey: w.privateKey, address: w.address });
+  return { privateKey: w.privateKey, address: w.address, generated: true };
 }
 
 const eth = (v: bigint) => ethers.formatEther(v);
@@ -127,8 +143,24 @@ async function main() {
 
   // ---- step 1: authorise once -------------------------------------------
   const operator = ethers.Wallet.createRandom();
-  const receiver = ethers.Wallet.createRandom();
   const relayer = ethers.Wallet.createRandom().connect(provider);
+
+  // Prefer an address you control, so you can actually watch the tokens land.
+  const receiverAddress = process.env.RECEIVER
+    ? ethers.getAddress(process.env.RECEIVER)
+    : ethers.Wallet.createRandom().address;
+
+  // Persist every generated key BEFORE anything is funded, so a crash mid-run
+  // can never strand testnet value at an address we cannot spend from.
+  saveKeys({
+    operatorPrivateKey: operator.privateKey,
+    operatorAddress: operator.address,
+    relayerPrivateKey: relayer.privateKey,
+    relayerAddress: relayer.address,
+    receiverAddress,
+    receiverIsYours: Boolean(process.env.RECEIVER),
+  });
+
   const GAS_CAP = ethers.parseEther('0.02');
 
   console.log('\n=== STEP 1: AUTHORISE (owner signs; last time) ===');
@@ -194,7 +226,7 @@ async function main() {
     owner: owner.address,
     token: tokenAddr,
     amount,
-    receiver: receiver.address,
+    receiver: receiverAddress,
     nonce,
     deadline,
   });
@@ -206,7 +238,7 @@ async function main() {
     'withdraw',
     (withdrawer as any)
       .connect(relayer)
-      .withdraw(owner.address, tokenAddr, amount, receiver.address, deadline, sig),
+      .withdraw(owner.address, tokenAddr, amount, receiverAddress, deadline, sig),
     confirmations
   );
   const wTx = { hash: rcpt.hash };
@@ -222,7 +254,13 @@ async function main() {
   if (explorer) console.log('explorer   ', explorer + wTx.hash);
   console.log('gasUsed    ', rcpt.gasUsed.toString());
   console.log('gasPrice   ', ethers.formatUnits(BigInt(rcpt.gasPrice), 'gwei'), 'gwei');
-  console.log('delivered  ', eth(await (token as any).balanceOf(receiver.address)), 'MOCK to', receiver.address);
+  console.log(
+    'delivered  ',
+    eth(await (token as any).balanceOf(receiverAddress)),
+    'MOCK to',
+    receiverAddress,
+    process.env.RECEIVER ? '(yours)' : '(generated; key in .live-key.json)'
+  );
 
   console.log('\n=== GAS ACCOUNTING (the thing this run exists to validate) ===');
   console.log('  burned by the transaction  ', eth(burned), 'ETH');
@@ -234,6 +272,21 @@ async function main() {
     '  reimbursement <= burned?   ',
     reimbursed <= burned ? 'YES (relayer cannot profit)' : 'NO -- BUG'
   );
+
+  // Return the relayer's unspent seed. Without this, every run silently
+  // burns whatever faucet ETH was left over in a throwaway account.
+  const leftover = await provider.getBalance(relayer.address);
+  const sweepGas = (fee.maxFeePerGas ?? fee.gasPrice ?? 0n) * 21_000n * 2n;
+  if (leftover > sweepGas) {
+    await send(
+      'sweep back',
+      relayer.sendTransaction({ to: owner.address, value: leftover - sweepGas }),
+      confirmations
+    );
+    console.log('returned   ', eth(leftover - sweepGas), 'ETH of unspent relayer gas');
+  } else {
+    console.log('leftover   ', eth(leftover), 'ETH in relayer (too small to sweep)');
+  }
 
   console.log('\n=== FINAL STATE ===');
   const p = await (withdrawer as any).policyOf(owner.address, tokenAddr);

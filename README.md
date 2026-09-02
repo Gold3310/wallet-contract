@@ -343,6 +343,11 @@ command again, and it completes end to end.
 
 Secrets go to gitignored `chmod 600` files and are never committed.
 
+**Nothing that can hold value is ever discarded.** Every generated key --
+owner, operator, relayer, receiver -- is written to `.live-key.json` *before*
+anything is funded, and the EVM runner sweeps unspent relayer gas back to the
+owner when it finishes. Set `RECEIVER` to use an address you already control.
+
 ### Ethereum (Sepolia)
 
 ```bash
@@ -350,7 +355,14 @@ cd evm && npm install
 RPC_URL=https://ethereum-sepolia-rpc.publicnode.com npm run live
 ```
 
-Needs ~0.08 test ETH for 7 transactions.
+Send the tokens to an address you control so you can watch them arrive:
+
+```bash
+RPC_URL=... RECEIVER=0xYourAddress npm run live
+```
+
+Needs ~0.08 test ETH for 8 transactions (the last one sweeps unspent relayer
+gas back to you).
 Faucets: [sepoliafaucet.com](https://sepoliafaucet.com), [Google Cloud faucet](https://cloud.google.com/application/web3/faucet/ethereum/sepolia).
 
 Prints the gas ledger the run exists to validate:
@@ -379,6 +391,10 @@ RPC_URL=http://127.0.0.1:8545 npm run live   # terminal 2
 ```bash
 cd btc && npm install
 npm run live
+```
+
+```bash
+RECEIVER=tb1qYourAddress npm run live
 ```
 
 Needs ~0.0006 signet BTC. Faucet: [signetfaucet.com](https://signetfaucet.com).
