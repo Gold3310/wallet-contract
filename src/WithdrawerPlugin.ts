@@ -23,6 +23,12 @@ export const OP = {
 } as const;
 
 /** Exit codes thrown by the plugin, mapped to something a human can act on. */
+/** Discriminator on external messages sent to the plugin. */
+export const EXT_OP = { WITHDRAW: 0, RECLAIM: 1 } as const;
+
+/** Seconds a pending payout must be stuck before anyone may reclaim it. */
+export const RECLAIM_TIMEOUT = 3600;
+
 export const PLUGIN_ERRORS: Record<number, string> = {
   30: 'Bad operator signature',
   33: 'Wrong seqno (replay or stale nonce)',
@@ -34,6 +40,10 @@ export const PLUGIN_ERRORS: Record<number, string> = {
   39: 'Amount must be greater than zero',
   40: 'Sender is not the paired wallet',
   41: 'Permissionless mode requires a non-empty receiver allowlist',
+  42: 'No pending payout with that query id',
+  43: 'Pending payout is not stale enough to reclaim yet',
+  44: 'Unknown external op',
+  71: 'Could not read gas/forward prices from network config',
 };
 
 export type WithdrawerConfig = {
@@ -132,12 +142,28 @@ export class WithdrawerPlugin implements Contract {
       .storeAddress(args.receiver)
       .endCell();
 
-    if (!args.operatorSecretKey) return payload;
+    if (!args.operatorSecretKey) {
+      return beginCell().storeUint(EXT_OP.WITHDRAW, 8).storeBuilder(payload.asBuilder()).endCell();
+    }
 
     return beginCell()
+      .storeUint(EXT_OP.WITHDRAW, 8)
       .storeBuffer(sign(payload.hash(), args.operatorSecretKey))
       .storeBuilder(payload.asBuilder())
       .endCell();
+  }
+
+  /**
+   * Restores allowance for a payout that never landed -- which happens when the
+   * wallet silently ignores the plugin (typically after a revoke). Permissionless
+   * and only valid once the entry is older than the on-chain reclaim timeout.
+   */
+  static buildReclaimBody(queryId: number | bigint): Cell {
+    return beginCell().storeUint(EXT_OP.RECLAIM, 8).storeUint(queryId, 64).endCell();
+  }
+
+  async sendReclaim(provider: ContractProvider, queryId: number | bigint) {
+    await provider.external(WithdrawerPlugin.buildReclaimBody(queryId));
   }
 
   async sendWithdraw(

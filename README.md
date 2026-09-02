@@ -1,31 +1,53 @@
-# Keyless withdrawals for TON Wallet v4
+# Keyless withdrawals — TON, Ethereum, Bitcoin
 
-Send assets from one wallet to another by pasting three things — **withdrawer, amount, receiver** — with **no private key, seed phrase or mnemonic** at the moment of sending.
+Authorise a wallet **once**. After that, move funds by pasting three things — **withdrawer, amount, receiver** — with no private key, seed phrase or mnemonic at the moment of sending.
 
 ```bash
-npm run withdraw -- --withdrawer EQAbc...xyz --amount 1.5 --receiver EQDef...uvw
+npm run withdraw -- --withdrawer <WALLET> --amount 1.5 --receiver <ADDRESS>   # TON
+```
+
+| chain | package | mechanism | arbitrary amount + receiver? | limits enforced by |
+|---|---|---|---|---|
+| **TON** | `/` (root) | wallet-v4 plugin | yes | the chain |
+| **Ethereum / EVM** | `evm/` | `approve` + `transferFrom`, or an ETH vault | yes | the chain |
+| **Bitcoin** | `btc/` | pre-signed transactions | **no — fixed at signing time** | cryptography |
+
+```bash
+npm install && npm run demo          # TON   16 tests
+cd evm && npm install && npm test    # EVM   18 tests
+cd btc && npm install && npm test    # BTC    9 tests
 ```
 
 ---
 
 ## Read this first
 
-**There is no way to move funds out of a wallet that never authorised you.** Not with this repo, not with any repo. Every blockchain requires either a signature from the key holder or a permission the key holder granted in advance. Any tool, contract or "flash USDT" service claiming otherwise is a scam, and the usual payload is that *you* paste *your* seed phrase into it.
+**There is no way to move funds out of a wallet that never authorised you.** Not with this repo, not with any repo. Every blockchain requires either a signature from the key holder or a permission the key holder granted in advance. Any tool claiming otherwise is a scam, and the payload is almost always "paste your seed phrase here."
 
 What is real, and what this repo implements, is a **pre-authorised pull payment**:
 
 | | who signs | when |
 |---|---|---|
-| **Once, to authorise** | the wallet owner | a single `authorize` transaction |
+| **Once, to authorise** | the wallet owner | a single setup transaction |
 | **Every withdrawal after that** | nobody, or a limited hot key | forever, keyless |
-
-The owner signs one transaction that installs a *withdrawer plugin* on their wallet, with hard spending limits written into the chain. From then on, withdrawals are triggered by pasting withdrawer + amount + receiver. The owner's key is never used again — and can revoke the whole thing at any time.
-
-This is exactly the mechanism wallet v4 was designed for ([TIPS-38](https://github.com/newton-blockchain/TIPs/issues/38)); this repo turns it into a general-purpose withdrawer instead of the fixed-destination subscription plugin that ships alongside it.
 
 ---
 
-## See it work in 30 seconds
+## Bitcoin is genuinely different — please read
+
+TON and Ethereum can enforce an allowance *on chain*: a capped, revocable permission that a limited key may exercise. **Bitcoin cannot.** It has no accounts, no `approve`, and no programmability that can say "this key may spend at most X." On Bitcoin, anything that can sign can sign away everything.
+
+So there are exactly two options, and neither is what the other two chains do:
+
+**A. Pre-signed vault — what `btc/` implements.** The owner signs a batch of withdrawals *in advance*. Broadcasting one later needs no key from anyone, and the limits are absolute because no other spend was ever signed. **The cost: amount and receiver are fixed when the vault is created.** You cannot paste an arbitrary amount to an arbitrary address.
+
+**B. A hot key that holds the coins.** This allows arbitrary amounts and receivers, but "limits" exist only in your software. If the key leaks, everything goes. That is custody with extra steps, so this repo does not implement it.
+
+If you need arbitrary keyless BTC payouts, the honest answer is that you want option B and should use a custodial provider that does it properly, or move that flow to TON/EVM.
+
+---
+
+## TON — see it work in 30 seconds
 
 No network, no funds, no setup beyond `npm install`:
 
@@ -117,7 +139,77 @@ The contract refuses to enter permissionless mode with an empty allowlist (exit 
 
 ---
 
-## How it works
+---
+
+## Ethereum / EVM
+
+`evm/contracts/Withdrawer.sol` — one contract serving many owners, many tokens.
+
+```bash
+cd evm && npm install
+npx hardhat test              # 18 tests
+npx hardhat run scripts/demo.ts
+```
+
+**Authorise once** (two owner-signed calls, both standard):
+
+```solidity
+token.approve(withdrawer, 100e18);                      // the ERC-20's own gate
+withdrawer.authorize(token, operator, 50e18, 10e18, 0, []);  // allowance, cap, cooldown, allowlist
+```
+
+**Withdraw forever, keyless.** Anyone can broadcast it and they pay the gas:
+
+```solidity
+withdrawer.withdraw(owner, token, amount, receiver, deadline, operatorSignature);
+```
+
+Native ETH has no `approve`, so it uses a vault: the owner deposits with `authorize{value: ...}` or `depositEth()`, and can always pull it back with `withdrawEth()`. ERC-20s are never held by the contract — the pull is a plain `transferFrom` gated by the owner's own approval, so shrinking the approval instantly caps the damage regardless of the policy.
+
+`canWithdraw(owner, token, amount, receiver)` is a free view that returns the same verdict the state-changing path would, with a human-readable reason.
+
+Same two modes as TON: an **operator key** signing EIP-712, or **permissionless** (`operator = address(0)`, empty signature) which the contract only permits alongside a receiver allowlist.
+
+---
+
+## Bitcoin
+
+`btc/src/vault.ts` — a pre-signed vault. Read the Bitcoin caveat above before using this.
+
+```bash
+cd btc && npm install
+npm test        # 9 tests
+npm run demo
+```
+
+```
+=== STEP 2: WITHDRAWALS (paste amount + receiver, no key) ===
+    0.00100000 BTC -> alice  txid=af04eedcb520ee0d…  signed=true  fee=550 sat
+    0.00250000 BTC -> bob    txid=e9a70040b36d1ab2…  signed=true  fee=550 sat
+
+=== WHAT IS AND IS NOT POSSIBLE ===
+  an amount nobody pre-signed         DOES NOT EXIST
+  a receiver nobody pre-signed        DOES NOT EXIST
+  redirecting a pre-signed payout     BREAKS THE SIGNATURE
+```
+
+**How it works.** One owner-signed *split* transaction fans the funding UTXO into a dedicated output per planned withdrawal, plus change. The owner then pre-signs one withdrawal per output. Because each spends a **different** output, they are not double-spends of one another and can be broadcast independently, in any order, or never.
+
+**Guarantees**, from cryptography rather than from a contract:
+
+| guarantee | why |
+|---|---|
+| Broadcasting needs no key | the signatures already exist |
+| Receiver cannot be changed | `SIGHASH_ALL` covers the outputs; the tests prove tampering invalidates it |
+| Amount cannot be raised | same |
+| Only planned payouts can happen | nothing else was ever signed |
+| Withdrawals don't conflict | each spends its own split output |
+| Owner can cancel | spend the split outputs elsewhere first |
+
+`inspectPresigned()` re-derives receiver, amount and signedness straight from the raw transaction, so a holder never has to trust the JSON sitting next to it.
+
+
+## How the TON plugin works
 
 ```
   external message              op 0x706c7567              funds
@@ -172,7 +264,7 @@ The contract refuses to enter permissionless mode with an empty allowlist (exit 
 
 ---
 
-## Tests
+## TON tests
 
 ```bash
 npm test

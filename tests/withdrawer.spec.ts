@@ -5,7 +5,11 @@ import '@ton/test-utils';
 import { randomBytes } from 'crypto';
 
 import { WalletV4 } from '../src/WalletV4';
-import { WithdrawerPlugin, withdrawerConfigToCell } from '../src/WithdrawerPlugin';
+import {
+  WithdrawerPlugin,
+  withdrawerConfigToCell,
+  RECLAIM_TIMEOUT,
+} from '../src/WithdrawerPlugin';
 import { compileWithdrawer, compileWalletV4 } from '../scripts/build';
 
 /** 0x706c7567 | 0x80000000 as an UNSIGNED 32-bit op, the way the VM reports it. */
@@ -433,6 +437,72 @@ describe('Wallet v4 keyless withdrawer plugin', () => {
       op: OP_PAYMENT_RESPONSE,
     });
     expect(await receiver.getBalance()).toBe(before);
+  });
+
+  it('reclaims allowance when the wallet silently ignores the plugin', async () => {
+    const plugin = await authorize({});
+
+    // Fund the plugin, then de-register it WITHOUT letting it self-destruct, so
+    // it stays alive pointing at a wallet that will now ignore it entirely.
+    await wallet.sendTransfer({
+      secretKey: ownerKeys.secretKey,
+      seqno: await wallet.getSeqno(),
+      validUntil: blockchain.now! + 300,
+      messages: [{ to: plugin.address, value: toNano('0.5'), bounce: false }],
+    });
+    await wallet.sendRemovePlugin({
+      secretKey: ownerKeys.secretKey,
+      seqno: await wallet.getSeqno(),
+      plugin: plugin.address,
+      value: 0n,
+      validUntil: blockchain.now! + 300,
+    });
+
+    // Three pulls that go nowhere: the wallet neither pays nor bounces.
+    const before = await receiver.getBalance();
+    for (let i = 0; i < 3; i++) {
+      await plugin.sendWithdraw({
+        seqno: await plugin.getSeqno(),
+        amount: toNano('1'),
+        receiver: receiver.address,
+        operatorSecretKey: operatorKeys.secretKey,
+        validUntil: blockchain.now! + 300,
+      });
+    }
+    expect(await receiver.getBalance()).toBe(before); // nothing was delivered
+    expect(await plugin.getRemainingAllowance()).toBe(toNano('7')); // but budget is held
+
+    // Too early to reclaim.
+    await expect(plugin.sendReclaim(0)).rejects.toThrow();
+
+    blockchain.now! += RECLAIM_TIMEOUT + 1;
+
+    // Anyone may now clean up each stuck entry; the budget comes back.
+    await plugin.sendReclaim(0);
+    expect(await plugin.getRemainingAllowance()).toBe(toNano('8'));
+    await plugin.sendReclaim(1);
+    await plugin.sendReclaim(2);
+    expect(await plugin.getRemainingAllowance()).toBe(toNano('10'));
+
+    // Reclaiming the same entry twice does nothing.
+    await expect(plugin.sendReclaim(0)).rejects.toThrow();
+  });
+
+  it('does not let reclaim touch a payout that actually succeeded', async () => {
+    const plugin = await authorize({});
+    await plugin.sendWithdraw({
+      seqno: 0,
+      amount: toNano('2'),
+      receiver: receiver.address,
+      operatorSecretKey: operatorKeys.secretKey,
+      validUntil: blockchain.now! + 300,
+    });
+    expect(await plugin.getRemainingAllowance()).toBe(toNano('8'));
+
+    blockchain.now! += RECLAIM_TIMEOUT + 1;
+    // the entry was cleared on delivery, so there is nothing to reclaim
+    await expect(plugin.sendReclaim(0)).rejects.toThrow();
+    expect(await plugin.getRemainingAllowance()).toBe(toNano('8'));
   });
 
   it('lets the owner retune limits and the allowlist through the wallet', async () => {

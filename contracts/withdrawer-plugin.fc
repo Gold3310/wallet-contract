@@ -49,11 +49,32 @@ int op::set_operator()    asm "0x6f707261 PUSHINT";   ;; "opra"
 
 ;; ------------------------------------------------------------------ tunables
 ;; Value attached to the "plug" request sent to the wallet (covers wallet gas).
-int fee::request()  asm "20000000 PUSHINT";   ;; 0.02 TON
+;; Stale pending payouts may be reclaimed by anyone after this long.
+int reclaim_timeout() asm "3600 PUSHINT";     ;; 1 hour
+
+;; Fees are read from network config rather than hardcoded, so the plugin keeps
+;; working if gas or forward prices change. Same approach as the subscription
+;; plugin that ships alongside this contract.
+int short_msg_fwd_fee(int workchain) inline {
+  int lump_price = config_param(25 + workchain).begin_parse().skip_bits(8).preload_uint(64);
+  return lump_price;
+}
+
+int gas_to_coins(int workchain, int gas) inline_ref {
+  var cs = config_param(21 + workchain).begin_parse();
+  if (cs.preload_uint(8) == 0xd1) {  ;; gas_flat_pfx
+    cs~skip_bits(8 + 64 + 64);
+  }
+  int tag = cs~load_uint(8);
+  throw_unless(71, (tag == 0xdd) | (tag == 0xde)); ;; gas_prices | gas_prices_ext
+  int gas_price = cs~load_uint(64);
+  return (gas * gas_price) >> 16;
+}
+
+;; Value attached to the "plug" request (must cover the wallet's own gas).
+int fee::request(int wc) inline { return gas_to_coins(wc, 15000) + short_msg_fwd_fee(wc); }
 ;; Extra requested on top of `amount` so the payout to the receiver is exact.
-int fee::forward()  asm "30000000 PUSHINT";   ;; 0.03 TON
-;; Balance the plugin keeps for itself so it is never deleted mid-flight.
-int fee::floor()    asm "50000000 PUSHINT";   ;; 0.05 TON
+int fee::forward(int wc) inline { return gas_to_coins(wc, 15000) + (short_msg_fwd_fee(wc) * 2); }
 
 ;; ------------------------------------------------------------------- errors
 ;; 30 bad signature            33 bad seqno            34 expired
@@ -132,6 +153,33 @@ int receiver_allowed?(cell receivers, int operator_key, slice receiver) inline {
   var (wallet, operator_key, seqno, total_allowance, max_per_withdrawal,
        cooldown, last_withdrawal, plugin_id, receivers, pending) = load_data();
 
+  int ext_op = in_msg~load_uint(8);
+
+  ;; ---- reclaim: undo a payout that never arrived --------------------------
+  ;; The wallet SILENTLY IGNORES requests from a plugin it no longer trusts --
+  ;; no throw, so no bounce, so the bounce handler never fires and the budget
+  ;; would otherwise stay spent forever. Anyone may clean that up, but only for
+  ;; entries that are genuinely stale, which bounds the work an attacker can
+  ;; cause to the number of stuck entries.
+  if (ext_op == 1) {
+    int query_id = in_msg~load_uint(64);
+    var (entry, found?) = pending.udict_get_ref?(64, query_id);
+    throw_unless(42, found?);
+    var es = entry.begin_parse();
+    es~load_msg_addr();
+    int stuck_amount = es~load_grams();
+    int created_at = es~load_uint(32);
+    throw_unless(43, now() >= created_at + reclaim_timeout());
+
+    accept_message();
+    pending~udict_delete?(64, query_id);
+    return save_data(wallet, operator_key, seqno, total_allowance + stuck_amount,
+                     max_per_withdrawal, cooldown, last_withdrawal, plugin_id,
+                     receivers, pending);
+  }
+
+  throw_unless(44, ext_op == 0);   ;; 0 = withdraw
+
   if (operator_key != 0) {
     var signature = in_msg~load_bits(512);
     throw_unless(30, check_signature(slice_hash(in_msg), signature, operator_key));
@@ -156,6 +204,7 @@ int receiver_allowed?(cell receivers, int operator_key, slice receiver) inline {
   pending~udict_set_ref(64, seqno, begin_cell()
     .store_slice(receiver)
     .store_grams(amount)
+    .store_uint(now(), 32)    ;; so a stuck payout can be reclaimed later
     .end_cell());
 
   save_data(wallet, operator_key, seqno + 1, total_allowance - amount,
@@ -163,14 +212,15 @@ int receiver_allowed?(cell receivers, int operator_key, slice receiver) inline {
   commit();
 
   ;; Ask the wallet for the money. Only works if the owner installed us.
+  (int wc, _) = parse_std_addr(wallet);
   send_raw_message(begin_cell()
     .store_uint(0x18, 6)                                  ;; bounceable
     .store_slice(wallet)
-    .store_grams(fee::request())
+    .store_grams(fee::request(wc))
     .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
     .store_uint(op::payment_request(), 32)
     .store_uint(seqno, 64)                                ;; query_id
-    .store_grams(amount + fee::forward())
+    .store_grams(amount + fee::forward(wc))
     .store_uint(0, 1)                                     ;; no extra currencies
     .end_cell(), 3);
 }
