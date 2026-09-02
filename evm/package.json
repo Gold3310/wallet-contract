@@ -5,7 +5,9 @@
   "scripts": {
     "build": "hardhat compile",
     "test": "hardhat test",
-    "demo": "hardhat run scripts/demo.ts"
+    "demo": "hardhat run scripts/demo.ts",
+    "live": "ts-node scripts/live.ts",
+    "node": "hardhat node"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "^2.1.2",

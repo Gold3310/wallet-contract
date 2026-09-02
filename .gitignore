@@ -9,3 +9,5 @@ evm/artifacts/
 evm/cache/
 evm/typechain-types/
 btc/dist/
+.live-key.json
+.testnet-keys.json

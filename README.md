@@ -335,6 +335,49 @@ Tests build wallet v4 from this repo's own FunC source; the CLI targets the cano
 
 ---
 
+## Running against a live network
+
+Everything above runs offline. To exercise the EVM path against a real node:
+
+```bash
+cd evm
+npx hardhat node                                  # terminal 1
+RPC_URL=http://127.0.0.1:8545 npm run live        # terminal 2
+```
+
+That performs real broadcasts with real receipts and prints the gas ledger:
+
+```
+gasUsed     127804
+gasPrice    1.348691336 gwei
+
+=== GAS ACCOUNTING ===
+  burned by the transaction   0.000172368147506144 ETH
+  reimbursed from sender      0.000170409847686272 ETH
+  relayer net cost            0.000001958299819872 ETH
+  relayer out of pocket       1.13% of gas burned
+  reimbursement <= burned?    YES (relayer cannot profit)
+```
+
+The same script runs unchanged against a public testnet:
+
+```bash
+RPC_URL=https://<sepolia-rpc> npm run live
+```
+
+With no `OWNER_PRIVATE_KEY` set it generates a throwaway key, saves it to
+`evm/.live-key.json` (gitignored, `chmod 600`) and prints the address to fund,
+then exits. Fund that address and run it again.
+
+To generate funding addresses for all three chains at once:
+
+```bash
+npm run testnet:addresses
+```
+
+
+---
+
 ## Scope and caveats
 
 - **Toncoin only.** Jettons (TON's fungible tokens) live in separate wallet contracts and need the plugin to forward a jetton transfer body — not implemented here.

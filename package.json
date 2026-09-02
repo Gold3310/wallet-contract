@@ -11,7 +11,8 @@
     "withdraw": "ts-node scripts/withdraw.ts",
     "revoke": "ts-node scripts/revoke.ts",
     "status": "ts-node scripts/status.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "testnet:addresses": "ts-node scripts/testnet-addresses.ts"
   },
   "devDependencies": {
     "@ton/test-utils": "^0.12.0",
