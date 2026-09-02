@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "test": "mocha -r ts-node/register test/**/*.test.ts --timeout 60000",
-    "demo": "ts-node src/demo.ts"
+    "demo": "ts-node src/demo.ts",
+    "live": "ts-node src/live.ts"
   },
   "dependencies": {
     "bip32": "^4.0.0",

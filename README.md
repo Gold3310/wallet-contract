@@ -337,43 +337,70 @@ Tests build wallet v4 from this repo's own FunC source; the CLI targets the cano
 
 ## Running against a live network
 
-Everything above runs offline. To exercise the EVM path against a real node:
+Each chain has a self-contained runner. All three generate a throwaway testnet
+key on first run, print the address to fund, and exit. Fund it, run the same
+command again, and it completes end to end.
+
+Secrets go to gitignored `chmod 600` files and are never committed.
+
+### Ethereum (Sepolia)
 
 ```bash
-cd evm
-npx hardhat node                                  # terminal 1
-RPC_URL=http://127.0.0.1:8545 npm run live        # terminal 2
+cd evm && npm install
+RPC_URL=https://ethereum-sepolia-rpc.publicnode.com npm run live
 ```
 
-That performs real broadcasts with real receipts and prints the gas ledger:
+Needs ~0.08 test ETH for 7 transactions.
+Faucets: [sepoliafaucet.com](https://sepoliafaucet.com), [Google Cloud faucet](https://cloud.google.com/application/web3/faucet/ethereum/sepolia).
+
+Prints the gas ledger the run exists to validate:
 
 ```
-gasUsed     127804
+gasUsed     127816
 gasPrice    1.348691336 gwei
 
 === GAS ACCOUNTING ===
-  burned by the transaction   0.000172368147506144 ETH
+  burned by the transaction   0.000172384331802176 ETH
   reimbursed from sender      0.000170409847686272 ETH
-  relayer net cost            0.000001958299819872 ETH
-  relayer out of pocket       1.13% of gas burned
+  relayer net cost            0.000001974484115904 ETH
+  relayer out of pocket       1.14% of gas burned
   reimbursement <= burned?    YES (relayer cannot profit)
 ```
 
-The same script runs unchanged against a public testnet:
+Against a local node instead:
 
 ```bash
-RPC_URL=https://<sepolia-rpc> npm run live
+npx hardhat node                             # terminal 1
+RPC_URL=http://127.0.0.1:8545 npm run live   # terminal 2
 ```
 
-With no `OWNER_PRIVATE_KEY` set it generates a throwaway key, saves it to
-`evm/.live-key.json` (gitignored, `chmod 600`) and prints the address to fund,
-then exits. Fund that address and run it again.
-
-To generate funding addresses for all three chains at once:
+### Bitcoin (signet)
 
 ```bash
-npm run testnet:addresses
+cd btc && npm install
+npm run live
 ```
+
+Needs ~0.0006 signet BTC. Faucet: [signetfaucet.com](https://signetfaucet.com).
+Wait for 1 confirmation before re-running. `BROADCAST=0 npm run live` builds and
+pre-signs everything without broadcasting.
+
+Step 3 is the interesting one: the withdrawal was signed in step 1, so nothing
+signs it at broadcast time.
+
+### TON (testnet)
+
+Uses the CLI documented above:
+
+```bash
+npm install
+OWNER_MNEMONIC="..." npm run authorize -- --allowance 5 --max-per 1
+npm run withdraw -- --withdrawer <WALLET> --amount 0.5 --receiver <ADDRESS>
+```
+
+Faucet: [@testgiver_ton_bot](https://t.me/testgiver_ton_bot). Needs ~2 test TON.
+
+To mint funding addresses for all three chains at once: `npm run testnet:addresses`.
 
 
 ---

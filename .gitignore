@@ -11,3 +11,5 @@ evm/typechain-types/
 btc/dist/
 .live-key.json
 .testnet-keys.json
+btc/.live-key.json
+btc/.live-vault.json
