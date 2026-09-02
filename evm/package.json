@@ -6,7 +6,7 @@
     "build": "hardhat compile",
     "test": "hardhat test",
     "demo": "hardhat run scripts/demo.ts",
-    "live": "ts-node scripts/live.ts",
+    "live": "hardhat compile && ts-node scripts/live.ts",
     "node": "hardhat node"
   },
   "devDependencies": {

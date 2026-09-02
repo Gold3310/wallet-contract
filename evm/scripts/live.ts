@@ -24,7 +24,23 @@ const KEY_FILE = path.join(ROOT, '.live-key.json');
 
 function artifact(name: string) {
   const p = path.join(ROOT, 'artifacts', 'contracts', name);
+  if (!fs.existsSync(p)) {
+    console.error(
+      '\nContracts are not compiled yet. Run:\n\n  npx hardhat compile\n\n' +
+        '(`npm run live` does this for you.)\n'
+    );
+    process.exit(1);
+  }
   return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+/** Sepolia and friends need real confirmations; a dev node mines instantly. */
+async function send(label: string, txPromise: Promise<any>, confirmations: number) {
+  const tx = await txPromise;
+  process.stdout.write(`  ${label.padEnd(12)} ${tx.hash} `);
+  const rcpt = await tx.wait(confirmations);
+  console.log('ok');
+  return rcpt;
 }
 
 function loadOrCreateKey(): { privateKey: string; address: string; generated: boolean } {
@@ -53,6 +69,9 @@ async function main() {
 
   const net = await provider.getNetwork();
   const isLocal = net.chainId === 31337n;
+  const confirmations = isLocal ? 0 : 1;
+  const explorer =
+    net.chainId === 11155111n ? 'https://sepolia.etherscan.io/tx/' : null;
 
   const key = loadOrCreateKey();
   const owner = new ethers.Wallet(key.privateKey, provider);
@@ -77,11 +96,14 @@ async function main() {
     console.log('funded ->  ', eth(balance), 'ETH');
   }
 
-  if (balance < ethers.parseEther('0.05')) {
+  const NEEDED = ethers.parseEther('0.08');
+  if (balance < NEEDED) {
     console.log('\n---------------------------------------------------------------');
     console.log('THIS ADDRESS NEEDS TESTNET FUNDS BEFORE THE RUN CAN CONTINUE:');
     console.log('\n   ' + owner.address + '\n');
-    console.log('Send it ~0.1 test ETH, then run this script again.');
+    console.log('It needs about ' + eth(NEEDED) + ' test ETH (7 transactions).');
+    console.log('Sepolia faucets: sepoliafaucet.com, cloud.google.com/application/web3/faucet');
+    console.log('\nThen run the same command again.');
     if (key.generated) console.log('The private key was saved to ' + KEY_FILE);
     console.log('---------------------------------------------------------------\n');
     process.exit(2);
@@ -101,7 +123,7 @@ async function main() {
   const tokenAddr = await token.getAddress();
   console.log('MockERC20  ', tokenAddr);
 
-  await (await (token as any).mint(owner.address, ethers.parseEther('1000'))).wait();
+  await send('mint', (token as any).mint(owner.address, ethers.parseEther('1000')), confirmations);
 
   // ---- step 1: authorise once -------------------------------------------
   const operator = ethers.Wallet.createRandom();
@@ -110,29 +132,40 @@ async function main() {
   const GAS_CAP = ethers.parseEther('0.02');
 
   console.log('\n=== STEP 1: AUTHORISE (owner signs; last time) ===');
-  const approveTx = await (token as any).approve(await withdrawer.getAddress(), ethers.parseEther('100'));
-  await approveTx.wait();
-  console.log('approve    ', approveTx.hash);
-
-  const authTx = await (withdrawer as any).authorize(
-    tokenAddr,
-    operator.address,
-    ethers.parseEther('50'),
-    ethers.parseEther('10'),
-    0,
-    [],
-    GAS_CAP,
-    { value: ethers.parseEther('0.02') } // gas tank
+  await send(
+    'approve',
+    (token as any).approve(await withdrawer.getAddress(), ethers.parseEther('100')),
+    confirmations
   );
-  await authTx.wait();
-  console.log('authorize  ', authTx.hash);
+  await send(
+    'authorize',
+    (withdrawer as any).authorize(
+      tokenAddr,
+      operator.address,
+      ethers.parseEther('50'),
+      ethers.parseEther('10'),
+      0,
+      [],
+      GAS_CAP,
+      { value: ethers.parseEther('0.02') } // gas tank
+    ),
+    confirmations
+  );
   console.log('operator   ', operator.address, '(hot key, not the wallet key)');
   console.log('gas tank   ', eth(await (withdrawer as any).gasTank(owner.address)), 'ETH');
 
-  // Give the relayer barely enough to broadcast, to prove reimbursement works.
-  const seed = ethers.parseEther(isLocal ? '0.05' : '0.004');
-  await (await owner.sendTransaction({ to: relayer.address, value: seed })).wait();
-  console.log('relayer    ', relayer.address, 'seeded with', eth(seed), 'ETH');
+  // Seed the relayer from live fee data rather than a guess: enough to cover
+  // one withdrawal at the current gas price, with headroom for a price spike.
+  const fee = await provider.getFeeData();
+  const gasPriceNow = fee.maxFeePerGas ?? fee.gasPrice ?? ethers.parseUnits('2', 'gwei');
+  const seed = gasPriceNow * 200_000n * 3n;
+  await send(
+    'seed relayer',
+    owner.sendTransaction({ to: relayer.address, value: seed }),
+    confirmations
+  );
+  console.log('relayer    ', relayer.address);
+  console.log('seeded     ', eth(seed), 'ETH at', ethers.formatUnits(gasPriceNow, 'gwei'), 'gwei');
 
   // ---- step 2: keyless withdrawal ---------------------------------------
   console.log('\n=== STEP 2: WITHDRAWAL (withdrawer + amount + receiver, no owner key) ===');
@@ -169,10 +202,14 @@ async function main() {
   const relayerBefore = await provider.getBalance(relayer.address);
   const tankBefore = await (withdrawer as any).gasTank(owner.address);
 
-  const wTx = await (withdrawer as any)
-    .connect(relayer)
-    .withdraw(owner.address, tokenAddr, amount, receiver.address, deadline, sig);
-  const rcpt = await wTx.wait();
+  const rcpt = await send(
+    'withdraw',
+    (withdrawer as any)
+      .connect(relayer)
+      .withdraw(owner.address, tokenAddr, amount, receiver.address, deadline, sig),
+    confirmations
+  );
+  const wTx = { hash: rcpt.hash };
 
   const relayerAfter = await provider.getBalance(relayer.address);
   const tankAfter = await (withdrawer as any).gasTank(owner.address);
@@ -182,6 +219,7 @@ async function main() {
   const relayerNet = BigInt(relayerBefore) - BigInt(relayerAfter);
 
   console.log('tx         ', wTx.hash);
+  if (explorer) console.log('explorer   ', explorer + wTx.hash);
   console.log('gasUsed    ', rcpt.gasUsed.toString());
   console.log('gasPrice   ', ethers.formatUnits(BigInt(rcpt.gasPrice), 'gwei'), 'gwei');
   console.log('delivered  ', eth(await (token as any).balanceOf(receiver.address)), 'MOCK to', receiver.address);
