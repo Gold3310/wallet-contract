@@ -1,3 +1,7 @@
 .idea/
 func/*.boc
 node_modules/
+build/
+dist/
+.withdrawers.json
+.env

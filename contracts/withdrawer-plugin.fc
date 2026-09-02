@@ -1,0 +1,333 @@
+;; ============================================================================
+;;  Withdrawer plugin for TON Wallet v4
+;; ----------------------------------------------------------------------------
+;;  PURPOSE
+;;  The owner of a wallet-v4 signs ONCE to install this plugin. From then on,
+;;  a withdrawal can be triggered by pasting three values -- withdrawer wallet,
+;;  amount, receiver -- WITHOUT the owner's private key ever being used again.
+;;
+;;  This is a pre-authorized pull payment. It is NOT, and cannot be, a way to
+;;  move funds out of a wallet that never authorized this plugin. The wallet-v4
+;;  code only honours op 0x706c7567 ("plug") from addresses present in its own
+;;  plugin dictionary, and adding an entry there requires the owner signature.
+;;
+;;  TWO AUTHORIZATION MODES (chosen at deploy time)
+;;    operator_key != 0 : each pull must be signed by the OPERATOR key. This is
+;;                        a hot key that is NOT the wallet owner key and that
+;;                        can never do anything except pull within the limits
+;;                        below. Receiver may be free-form or allowlisted.
+;;    operator_key == 0 : fully permissionless -- literally anyone can trigger a
+;;                        pull with no key at all. Because of that, the receiver
+;;                        allowlist is MANDATORY in this mode: funds can only
+;;                        ever land on an address the owner pre-approved.
+;;
+;;  HARD LIMITS ENFORCED ON CHAIN (set by the owner, changeable only by the owner)
+;;    total_allowance    : lifetime budget, decremented on every pull
+;;    max_per_withdrawal : ceiling for a single pull
+;;    cooldown           : minimum seconds between two pulls
+;;    receivers          : allowlist of permitted destinations
+;;
+;;  FLOW
+;;    1. external msg -> plugin        (validated, no owner key)
+;;    2. plugin -> wallet  op "plug"   (request amount + fee reserve)
+;;    3. wallet -> plugin  op "plug"|0x80000000  (funds arrive)
+;;    4. plugin -> receiver            (exact amount forwarded)
+;;    A bounce at step 2/3 restores the allowance and clears the pending entry.
+;; ============================================================================
+
+#pragma version >=0.4.0;
+
+;; ---------------------------------------------------------------- operations
+int op::payment_request() asm "0x706c7567 PUSHINT";   ;; "plug"
+int op::destruct()        asm "0x64737472 PUSHINT";   ;; "dstr"
+int op::note()            asm "0x6e6f7465 PUSHINT";   ;; "note" (install ping)
+int op::withdrawal()      asm "0x77746864 PUSHINT";   ;; "wthd" (tag on payout)
+int op::topup()           asm "0x746f7075 PUSHINT";   ;; "topu"
+int op::set_limits()      asm "0x6c696d74 PUSHINT";   ;; "limt"
+int op::set_receiver()    asm "0x72637672 PUSHINT";   ;; "rcvr"
+int op::set_operator()    asm "0x6f707261 PUSHINT";   ;; "opra"
+
+;; ------------------------------------------------------------------ tunables
+;; Value attached to the "plug" request sent to the wallet (covers wallet gas).
+int fee::request()  asm "20000000 PUSHINT";   ;; 0.02 TON
+;; Extra requested on top of `amount` so the payout to the receiver is exact.
+int fee::forward()  asm "30000000 PUSHINT";   ;; 0.03 TON
+;; Balance the plugin keeps for itself so it is never deleted mid-flight.
+int fee::floor()    asm "50000000 PUSHINT";   ;; 0.05 TON
+
+;; ------------------------------------------------------------------- errors
+;; 30 bad signature            33 bad seqno            34 expired
+;; 35 amount over per-tx cap   36 amount over budget    37 cooldown active
+;; 38 receiver not allowlisted 39 zero amount           40 not the wallet
+;; 41 permissionless mode requires an allowlist
+
+(int) slice_data_equal?(slice a, slice b) asm "SDEQ";
+
+;; ------------------------------------------------------------------ storage
+;; storage#_ wallet:MsgAddressInt
+;;           operator_key:uint256
+;;           seqno:uint32
+;;           total_allowance:Grams
+;;           max_per_withdrawal:Grams
+;;           cooldown:uint32
+;;           last_withdrawal:uint32
+;;           plugin_id:uint32
+;;           receivers:(HashmapE 256 Unit)
+;;           pending:(HashmapE 64 ^[receiver amount])  = Storage;
+
+(slice, int, int, int, int, int, int, int, cell, cell) load_data() inline {
+  var ds = get_data().begin_parse();
+  return (
+    ds~load_msg_addr(),   ;; wallet
+    ds~load_uint(256),    ;; operator_key
+    ds~load_uint(32),     ;; seqno
+    ds~load_grams(),      ;; total_allowance
+    ds~load_grams(),      ;; max_per_withdrawal
+    ds~load_uint(32),     ;; cooldown
+    ds~load_uint(32),     ;; last_withdrawal
+    ds~load_uint(32),     ;; plugin_id
+    ds~load_dict(),       ;; receivers
+    ds~load_dict()        ;; pending
+  );
+}
+
+() save_data(slice wallet, int operator_key, int seqno, int total_allowance,
+             int max_per_withdrawal, int cooldown, int last_withdrawal,
+             int plugin_id, cell receivers, cell pending) impure inline {
+  set_data(begin_cell()
+    .store_slice(wallet)
+    .store_uint(operator_key, 256)
+    .store_uint(seqno, 32)
+    .store_grams(total_allowance)
+    .store_grams(max_per_withdrawal)
+    .store_uint(cooldown, 32)
+    .store_uint(last_withdrawal, 32)
+    .store_uint(plugin_id, 32)
+    .store_dict(receivers)
+    .store_dict(pending)
+    .end_cell());
+}
+
+;; Addresses are keyed the same way wallet-v4 keys its plugin dict: wc:int8 + hash:uint256
+slice addr_key(slice addr) inline {
+  (int wc, int hash) = parse_std_addr(addr);
+  return begin_cell().store_int(wc, 8).store_uint(hash, 256).end_cell().begin_parse();
+}
+
+int receiver_allowed?(cell receivers, int operator_key, slice receiver) inline {
+  if (cell_null?(receivers)) {
+    ;; No allowlist configured: only acceptable when an operator key guards pulls.
+    return operator_key != 0;
+  }
+  var (_, found?) = receivers.udict_get?(256, slice_hash(addr_key(receiver)));
+  return found?;
+}
+
+;; ============================================================ external pulls
+;; body (operator mode) : signature:bits512 valid_until:uint32 seqno:uint32
+;;                        amount:Grams receiver:MsgAddressInt
+;; body (open mode)     :                valid_until:uint32 seqno:uint32
+;;                        amount:Grams receiver:MsgAddressInt
+() recv_external(slice in_msg) impure {
+  var (wallet, operator_key, seqno, total_allowance, max_per_withdrawal,
+       cooldown, last_withdrawal, plugin_id, receivers, pending) = load_data();
+
+  if (operator_key != 0) {
+    var signature = in_msg~load_bits(512);
+    throw_unless(30, check_signature(slice_hash(in_msg), signature, operator_key));
+  }
+
+  int valid_until = in_msg~load_uint(32);
+  int msg_seqno   = in_msg~load_uint(32);
+  int amount      = in_msg~load_grams();
+  slice receiver  = in_msg~load_msg_addr();
+
+  throw_unless(33, msg_seqno == seqno);
+  throw_if(34, valid_until <= now());
+  throw_unless(39, amount > 0);
+  throw_unless(35, amount <= max_per_withdrawal);
+  throw_unless(36, amount <= total_allowance);
+  throw_unless(37, now() >= last_withdrawal + cooldown);
+  throw_unless(38, receiver_allowed?(receivers, operator_key, receiver));
+
+  accept_message();
+
+  ;; Remember what this query_id owes to whom, so the payout leg knows where to go.
+  pending~udict_set_ref(64, seqno, begin_cell()
+    .store_slice(receiver)
+    .store_grams(amount)
+    .end_cell());
+
+  save_data(wallet, operator_key, seqno + 1, total_allowance - amount,
+            max_per_withdrawal, cooldown, now(), plugin_id, receivers, pending);
+  commit();
+
+  ;; Ask the wallet for the money. Only works if the owner installed us.
+  send_raw_message(begin_cell()
+    .store_uint(0x18, 6)                                  ;; bounceable
+    .store_slice(wallet)
+    .store_grams(fee::request())
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op::payment_request(), 32)
+    .store_uint(seqno, 64)                                ;; query_id
+    .store_grams(amount + fee::forward())
+    .store_uint(0, 1)                                     ;; no extra currencies
+    .end_cell(), 3);
+}
+
+;; ========================================================== internal handling
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+  var cs = in_msg_cell.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  var (wallet, operator_key, seqno, total_allowance, max_per_withdrawal,
+       cooldown, last_withdrawal, plugin_id, receivers, pending) = load_data();
+
+  ;; ---- bounce: the wallet refused (e.g. insufficient balance). Roll back. ----
+  if (flags & 1) {
+    in_msg~skip_bits(32);                     ;; 0xFFFFFFFF bounce prefix
+    if (in_msg.slice_bits() >= 32 + 64) {
+      int op = in_msg~load_uint(32);
+      int query_id = in_msg~load_uint(64);
+      if (op == op::payment_request()) {
+        var (entry, found?) = pending.udict_get_ref?(64, query_id);
+        if (found?) {
+          var es = entry.begin_parse();
+          es~load_msg_addr();
+          int amount = es~load_grams();
+          pending~udict_delete?(64, query_id);
+          save_data(wallet, operator_key, seqno, total_allowance + amount,
+                    max_per_withdrawal, cooldown, last_withdrawal, plugin_id,
+                    receivers, pending);
+        }
+      }
+    }
+    return ();
+  }
+
+  if (in_msg.slice_bits() < 32) {
+    return ();                                 ;; plain top-up
+  }
+
+  int op = in_msg~load_uint(32);
+
+  ;; Everything below is privileged: only the paired wallet may issue it.
+  throw_unless(40, slice_data_equal?(addr_key(sender), addr_key(wallet)));
+
+  ;; ---- payout leg: funds arrived from the wallet, forward them on ----
+  if (op == (op::payment_request() | 0x80000000)) {
+    int query_id = in_msg~load_uint(64);
+    var (entry, found?) = pending.udict_get_ref?(64, query_id);
+    if (~ found?) {
+      return ();
+    }
+    var es = entry.begin_parse();
+    slice receiver = es~load_msg_addr();
+    int amount = es~load_grams();
+    pending~udict_delete?(64, query_id);
+    save_data(wallet, operator_key, seqno, total_allowance, max_per_withdrawal,
+              cooldown, last_withdrawal, plugin_id, receivers, pending);
+
+    ;; mode 1: pay forward fees out of the plugin balance so the receiver
+    ;; is credited with exactly `amount`.
+    send_raw_message(begin_cell()
+      .store_uint(0x10, 6)                     ;; non-bounceable
+      .store_slice(receiver)
+      .store_grams(amount)
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_uint(op::withdrawal(), 32)
+      .store_uint(query_id, 64)
+      .end_cell(), 1);
+    return ();
+  }
+
+  if (op == op::note()) {                      ;; install acknowledgement
+    return ();
+  }
+
+  if (op == op::topup()) {
+    return ();
+  }
+
+  ;; ---- owner administration (arrives already signed, via the wallet) ----
+  int query_id = in_msg~load_uint(64);
+
+  if (op == op::set_limits()) {
+    int new_total = in_msg~load_grams();
+    int new_max   = in_msg~load_grams();
+    int new_cool  = in_msg~load_uint(32);
+    return save_data(wallet, operator_key, seqno, new_total, new_max, new_cool,
+                     last_withdrawal, plugin_id, receivers, pending);
+  }
+
+  if (op == op::set_receiver()) {
+    slice receiver = in_msg~load_msg_addr();
+    int allow = in_msg~load_uint(1);
+    int key = slice_hash(addr_key(receiver));
+    if (allow) {
+      receivers~udict_set(256, key, begin_cell().end_cell().begin_parse());
+    } else {
+      receivers~udict_delete?(256, key);
+    }
+    return save_data(wallet, operator_key, seqno, total_allowance,
+                     max_per_withdrawal, cooldown, last_withdrawal, plugin_id,
+                     receivers, pending);
+  }
+
+  if (op == op::set_operator()) {
+    int new_key = in_msg~load_uint(256);
+    ;; Refuse to drop into permissionless mode without an allowlist.
+    throw_if(41, (new_key == 0) & (cell_null?(receivers)));
+    return save_data(wallet, new_key, seqno, total_allowance,
+                     max_per_withdrawal, cooldown, last_withdrawal, plugin_id,
+                     receivers, pending);
+  }
+
+  if (op == op::destruct()) {
+    ;; Tell the wallet to forget us, then return every nanoton to the wallet.
+    send_raw_message(begin_cell()
+      .store_uint(0x10, 6)
+      .store_slice(wallet)
+      .store_grams(0)
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_uint(op::destruct(), 32)
+      .store_uint(query_id, 64)
+      .end_cell(), 128 + 32);
+    return ();
+  }
+}
+
+;; ================================================================ get methods
+(int, int, int, int, int, int, int) get_withdrawer_data() method_id {
+  var (wallet, operator_key, seqno, total_allowance, max_per_withdrawal,
+       cooldown, last_withdrawal, plugin_id, receivers, pending) = load_data();
+  return (operator_key, seqno, total_allowance, max_per_withdrawal, cooldown,
+          last_withdrawal, plugin_id);
+}
+
+slice get_wallet() method_id {
+  var (wallet, _, _, _, _, _, _, _, _, _) = load_data();
+  return wallet;
+}
+
+int get_seqno() method_id {
+  var (_, _, seqno, _, _, _, _, _, _, _) = load_data();
+  return seqno;
+}
+
+int get_remaining_allowance() method_id {
+  var (_, _, _, total_allowance, _, _, _, _, _, _) = load_data();
+  return total_allowance;
+}
+
+;; Mirrors the on-chain admission check so a client can dry-run before paying.
+int is_receiver_allowed(int wc, int addr_hash) method_id {
+  var (_, operator_key, _, _, _, _, _, _, receivers, _) = load_data();
+  if (cell_null?(receivers)) {
+    return operator_key != 0;
+  }
+  slice key = begin_cell().store_int(wc, 8).store_uint(addr_hash, 256).end_cell().begin_parse();
+  var (_, found?) = receivers.udict_get?(256, slice_hash(key));
+  return found?;
+}
