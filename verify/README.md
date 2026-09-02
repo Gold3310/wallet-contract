@@ -11,6 +11,22 @@ the three public values:
 
 It recovers the signer from the signature and compares it to your address.
 
+## TON address checker (`ton-address.mjs`)
+
+Offline, dependency-free decoder/comparator for TON addresses, useful when one
+key shows two addresses and a transfer is not visible in the receiving app:
+
+```bash
+node ton-address.mjs compare EQ... UQ...     # same on-chain account or not?
+node ton-address.mjs info EQ...              # decode flags/workchain/account id
+node ton-address.mjs convert EQ...           # all spellings of one account
+```
+
+Exit code `0` = same account (only the spelling differs), `1` = different
+accounts, `2` = malformed/mistyped address (CRC16 check). Addresses are public
+values — this tool never needs a seed phrase or private key, and you should
+never give those to any tool or site.
+
 ## Message used by default
 
 ```
