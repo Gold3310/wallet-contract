@@ -6,17 +6,19 @@ Authorise a wallet **once**. After that, move funds by pasting three things — 
 npm run withdraw -- --withdrawer <WALLET> --amount 1.5 --receiver <ADDRESS>   # TON
 ```
 
-| chain | package | mechanism | arbitrary amount + receiver? | limits enforced by |
-|---|---|---|---|---|
-| **TON** | `/` (root) | wallet-v4 plugin | yes | the chain |
-| **Ethereum / EVM** | `evm/` | `approve` + `transferFrom`, or an ETH vault | yes | the chain |
-| **Bitcoin** | `btc/` | pre-signed transactions | **no — fixed at signing time** | cryptography |
+| chain | package | mechanism | arbitrary amount + receiver? | limits enforced by | gas paid by |
+|---|---|---|---|---|---|
+| **TON** | `/` (root) | wallet-v4 plugin | yes | the chain | sender wallet |
+| **Ethereum / EVM** | `evm/` | `approve` + `transferFrom`, or an ETH vault | yes | the chain | sender wallet |
+| **Bitcoin** | `btc/` | pre-signed transactions | **no — fixed at signing time** | cryptography | sender wallet |
 
 ```bash
-npm install && npm run demo          # TON   16 tests
-cd evm && npm install && npm test    # EVM   18 tests
-cd btc && npm install && npm test    # BTC    9 tests
+npm install && npm run demo          # TON   18 tests
+cd evm && npm install && npm test    # EVM   28 tests
+cd btc && npm install && npm test    # BTC   11 tests
 ```
+
+Gas is paid by the **sender wallet** on all three chains — see [Who pays the gas](#who-pays-the-gas).
 
 ---
 
@@ -44,6 +46,33 @@ So there are exactly two options, and neither is what the other two chains do:
 **B. A hot key that holds the coins.** This allows arbitrary amounts and receivers, but "limits" exist only in your software. If the key leaks, everything goes. That is custody with extra steps, so this repo does not implement it.
 
 If you need arbitrary keyless BTC payouts, the honest answer is that you want option B and should use a custodial provider that does it properly, or move that flow to TON/EVM.
+
+---
+
+## Who pays the gas
+
+**The sender wallet does, on all three chains.** Whoever triggers a withdrawal should never be out of pocket, and receivers are always credited the full amount — never net of a fee.
+
+| chain | how the sender pays | broadcaster's net cost |
+|---|---|---|
+| **TON** | the plugin requests `amount + fees` from the wallet and forwards `amount` with send-mode 1, so it reimburses its own outlay | zero — external messages are gasless to send |
+| **Ethereum** | the withdrawal measures its own gas and refunds the broadcaster in ETH from the owner's **gas tank** | ~1% (a deliberate under-estimate; see below) |
+| **Bitcoin** | the fee is pre-funded into each bucket by the split transaction | zero — no input of their own is needed |
+
+**TON.** The plugin fronts the request-leg gas from its own float and asks the wallet for enough to cover that, the external-message gas, the payout leg and the forward fee. Its balance is flat-to-slightly-positive across withdrawals, so it runs indefinitely without being topped up, and the accumulated float returns to the wallet on revoke. Both properties are asserted in the tests.
+
+**Ethereum.** `authorize(..., maxGasReimbursement)` with ETH attached funds a **gas tank** kept strictly separate from the ETH vault, so paying for gas can never eat the principal. Each withdrawal meters `gasleft()` and refunds `msg.sender`.
+
+Three independent limits bound the refund, and they matter:
+
+- `maxGasReimbursement` — the owner's per-withdrawal ceiling. **Without this a hostile relayer could broadcast at a 5000 gwei gas price and drain the tank**; there is a test for exactly that.
+- the actual measured gas, so a refund can never exceed what was really burned.
+- the tank balance — and when it is empty the withdrawal still succeeds, with the broadcaster simply absorbing the cost.
+
+`GAS_OVERHEAD` (38,000) covers the intrinsic cost, calldata and the refund transfer itself. It is **deliberately a slight under-estimate**: over-estimating would let relayers turn a profit at the sender's expense, so the broadcaster is left ~1% short rather than the sender ever overpaying.
+
+**Bitcoin.** Each split output holds `amount + fee`, so a pre-signed withdrawal spends its bucket and pays exactly `amount` to the receiver, with the difference going to the miner. A test checks the whole ledger balances: `payouts + withdrawal fees + split fee + change == funding`.
+
 
 ---
 
@@ -155,7 +184,8 @@ npx hardhat run scripts/demo.ts
 
 ```solidity
 token.approve(withdrawer, 100e18);                      // the ERC-20's own gate
-withdrawer.authorize(token, operator, 50e18, 10e18, 0, []);  // allowance, cap, cooldown, allowlist
+// allowance, per-tx cap, cooldown, allowlist, max gas reimbursement
+withdrawer.authorize{value: 0.5 ether}(token, operator, 50e18, 10e18, 0, [], 0.05 ether);
 ```
 
 **Withdraw forever, keyless.** Anyone can broadcast it and they pay the gas:

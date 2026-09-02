@@ -55,6 +55,13 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         uint64 lastWithdrawal;
         bool allowlistOnly;
         bool exists;
+        /**
+         * Ceiling, in wei, on what a single withdrawal may reimburse to whoever
+         * broadcast it. Zero disables reimbursement entirely (the caller then
+         * eats the gas). This cap is what stops a hostile relayer from
+         * emptying the gas tank by broadcasting at an absurd gas price.
+         */
+        uint256 maxGasReimbursement;
     }
 
     /// owner => token => policy
@@ -63,8 +70,18 @@ contract Withdrawer is EIP712, ReentrancyGuard {
     mapping(address => mapping(address => mapping(address => bool))) public allowlisted;
     /// owner => token => nonce (replay protection, monotonic)
     mapping(address => mapping(address => uint256)) public nonces;
-    /// owner => ETH held in the vault for pulls
+    /// owner => ETH held in the vault, spendable as NATIVE withdrawals
     mapping(address => uint256) public ethVault;
+    /// owner => ETH set aside purely to reimburse whoever broadcasts a withdrawal
+    mapping(address => uint256) public gasTank;
+
+    /**
+     * Gas consumed outside the metered region: the 21k intrinsic cost, calldata,
+     * and the reimbursement transfer itself. Deliberately a slight
+     * under-estimate, so the sender wallet can never be charged for more gas
+     * than the transaction actually burned.
+     */
+    uint256 public constant GAS_OVERHEAD = 38_000;
 
     bytes32 private constant WITHDRAW_TYPEHASH =
         keccak256(
@@ -99,6 +116,10 @@ contract Withdrawer is EIP712, ReentrancyGuard {
     );
     event Revoked(address indexed owner, address indexed token);
     event EthDeposited(address indexed owner, uint256 amount);
+    event GasDeposited(address indexed owner, uint256 amount);
+    event GasWithdrawnByOwner(address indexed owner, uint256 amount);
+    event GasReimbursed(address indexed owner, address indexed relayer, uint256 amount);
+    event GasReimbursementChanged(address indexed owner, address indexed token, uint256 maxGasReimbursement);
     event EthWithdrawnByOwner(address indexed owner, uint256 amount);
 
     error NoPolicy();
@@ -115,6 +136,8 @@ contract Withdrawer is EIP712, ReentrancyGuard {
     error InsufficientVault();
     error EthTransferFailed();
     error CapAboveAllowance();
+    error GasReimbursementFailed();
+    error GasTankEmpty();
 
     constructor() EIP712("Withdrawer", "1") {}
 
@@ -153,6 +176,21 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         return (true, "");
     }
 
+    /// @notice What a withdrawal would currently reimburse its broadcaster.
+    function reimbursementPreview(
+        address owner,
+        address token,
+        uint256 gasPrice,
+        uint256 gasUsed
+    ) external view returns (uint256) {
+        Policy storage p = _policies[owner][token];
+        if (!p.exists || p.maxGasReimbursement == 0) return 0;
+        uint256 spent = (gasUsed + GAS_OVERHEAD) * gasPrice;
+        if (spent > p.maxGasReimbursement) spent = p.maxGasReimbursement;
+        if (spent > gasTank[owner]) spent = gasTank[owner];
+        return spent;
+    }
+
     function digestFor(
         address owner,
         address token,
@@ -183,7 +221,8 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         uint256 allowance,
         uint256 maxPerWithdrawal,
         uint64 cooldown,
-        address[] calldata receivers
+        address[] calldata receivers,
+        uint256 maxGasReimbursement
     ) external payable {
         Policy storage p = _policies[msg.sender][token];
         if (p.exists) revert PolicyExists();
@@ -196,6 +235,7 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         p.cooldown = cooldown;
         p.lastWithdrawal = 0;
         p.allowlistOnly = receivers.length > 0;
+        p.maxGasReimbursement = maxGasReimbursement;
         p.exists = true;
 
         for (uint256 i = 0; i < receivers.length; i++) {
@@ -203,9 +243,16 @@ contract Withdrawer is EIP712, ReentrancyGuard {
             emit ReceiverSet(msg.sender, token, receivers[i], true);
         }
 
+        // For an ETH policy the deposit is the principal being made available;
+        // for a token policy the only reason to send ETH is to fund gas.
         if (msg.value > 0) {
-            ethVault[msg.sender] += msg.value;
-            emit EthDeposited(msg.sender, msg.value);
+            if (token == NATIVE) {
+                ethVault[msg.sender] += msg.value;
+                emit EthDeposited(msg.sender, msg.value);
+            } else {
+                gasTank[msg.sender] += msg.value;
+                emit GasDeposited(msg.sender, msg.value);
+            }
         }
 
         emit Authorized(msg.sender, token, operator, allowance, maxPerWithdrawal, cooldown, p.allowlistOnly);
@@ -226,6 +273,7 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         uint256 deadline,
         bytes calldata signature
     ) external nonReentrant {
+        uint256 gasStart = gasleft();
         Policy storage p = _policies[owner][token];
         if (!p.exists) revert NoPolicy();
         if (amount == 0) revert ZeroAmount();
@@ -260,6 +308,35 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         }
 
         emit Withdrawn(owner, token, receiver, amount, nonce, msg.sender);
+
+        // THE SENDER WALLET PAYS THE GAS.
+        // Whoever broadcast this is refunded, in ETH, out of the owner's gas
+        // tank -- so a relayer is only ever fronting the fee, never bearing it.
+        _reimburse(owner, p.maxGasReimbursement, gasStart);
+    }
+
+    /**
+     * @dev Refunds `msg.sender` for the gas this transaction burned, bounded by
+     *      three independent limits: the owner's per-withdrawal cap, the actual
+     *      measured gas, and the balance of the gas tank. Runs last, after every
+     *      state change, and under the reentrancy guard.
+     */
+    function _reimburse(address owner, uint256 cap, uint256 gasStart) private {
+        if (cap == 0) return; // reimbursement disabled for this policy
+
+        uint256 tank = gasTank[owner];
+        if (tank == 0) return; // nothing to pay from; the caller absorbs it
+
+        uint256 spent = (gasStart - gasleft() + GAS_OVERHEAD) * tx.gasprice;
+        if (spent > cap) spent = cap;
+        if (spent > tank) spent = tank;
+        if (spent == 0) return;
+
+        gasTank[owner] = tank - spent;
+        (bool sent, ) = msg.sender.call{value: spent}("");
+        if (!sent) revert GasReimbursementFailed();
+
+        emit GasReimbursed(owner, msg.sender, spent);
     }
 
     // -------------------------------------------------- owner administration
@@ -287,6 +364,13 @@ contract Withdrawer is EIP712, ReentrancyGuard {
         emit ReceiverSet(msg.sender, token, receiver, allowed);
     }
 
+    function setGasReimbursement(address token, uint256 maxGasReimbursement) external {
+        Policy storage p = _policies[msg.sender][token];
+        if (!p.exists) revert NoPolicy();
+        p.maxGasReimbursement = maxGasReimbursement;
+        emit GasReimbursementChanged(msg.sender, token, maxGasReimbursement);
+    }
+
     function setOperator(address token, address operator) external {
         Policy storage p = _policies[msg.sender][token];
         if (!p.exists) revert NoPolicy();
@@ -304,6 +388,22 @@ contract Withdrawer is EIP712, ReentrancyGuard {
     }
 
     // --------------------------------------------------------- ETH vault
+
+    /// @notice Top up the ETH used to reimburse whoever broadcasts withdrawals.
+    function depositGas() external payable {
+        gasTank[msg.sender] += msg.value;
+        emit GasDeposited(msg.sender, msg.value);
+    }
+
+    /// @notice The owner can always reclaim unspent gas money.
+    function withdrawGas(uint256 amount) external nonReentrant {
+        uint256 tank = gasTank[msg.sender];
+        if (tank < amount) revert InsufficientVault();
+        gasTank[msg.sender] = tank - amount;
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        if (!sent) revert EthTransferFailed();
+        emit GasWithdrawnByOwner(msg.sender, amount);
+    }
 
     function depositEth() external payable {
         ethVault[msg.sender] += msg.value;

@@ -23,15 +23,20 @@ async function main() {
 
   // ---- step 1: the one owner-signed setup -------------------------------
   await token.connect(owner).approve(await withdrawer.getAddress(), ethers.parseEther('100'));
+  const GAS_CAP = ethers.parseEther('0.05');
   await withdrawer
     .connect(owner)
-    .authorize(tokenAddr, operator.address, ethers.parseEther('50'), ethers.parseEther('20'), 0, []);
+    .authorize(tokenAddr, operator.address, ethers.parseEther('50'), ethers.parseEther('20'), 0, [], GAS_CAP, {
+      value: ethers.parseEther('0.5'), // gas tank: the SENDER pays the gas
+    });
 
   console.log('\n=== STEP 1: AUTHORISE (owner signs twice: approve + authorize) ===');
   console.log('operator   ', operator.address, '(a hot key, NOT the wallet key)');
   const p0 = await withdrawer.policyOf(await owner.getAddress(), tokenAddr);
   console.log('allowance  ', fmt(p0.allowance), 'MOCK');
   console.log('max per    ', fmt(p0.maxPerWithdrawal), 'MOCK');
+  console.log('gas tank   ', fmt(await withdrawer.gasTank(await owner.getAddress())), 'ETH');
+  console.log('gas cap    ', fmt(GAS_CAP), 'ETH per withdrawal');
   console.log('\n>>> The owner is now offline for the rest of this demo. <<<');
 
   // ---- step 2: keyless pulls --------------------------------------------
@@ -54,6 +59,9 @@ async function main() {
   };
 
   console.log('\n=== STEP 2: WITHDRAWALS (withdrawer + amount + receiver) ===');
+  const relayerStart = await ethers.provider.getBalance(await relayer.getAddress());
+  const tankStart = await withdrawer.gasTank(await owner.getAddress());
+
   for (const [amt, to, label] of [
     ['12', alice, 'alice'],
     ['8', bob, 'bob'],
@@ -69,11 +77,23 @@ async function main() {
     };
     const sig = await operator.signTypedData(domain, types, args);
     // broadcast by an unrelated relayer, who also pays the gas
-    await withdrawer
+    const tx = await withdrawer
       .connect(relayer)
       .withdraw(args.owner, args.token, args.amount, args.receiver, args.deadline, sig);
-    console.log(`  amount=${amt.padStart(4)} MOCK -> ${label}   DELIVERED (gas paid by relayer)`);
+    const rcpt = await tx.wait();
+    const burned = rcpt!.gasUsed * rcpt!.gasPrice;
+    console.log(
+      `  amount=${amt.padStart(4)} MOCK -> ${label.padEnd(6)} DELIVERED  ` +
+        `gas burned ${ethers.formatEther(burned)} ETH`
+    );
   }
+
+  const relayerEnd = await ethers.provider.getBalance(await relayer.getAddress());
+  const tankEnd = await withdrawer.gasTank(await owner.getAddress());
+  console.log('\n=== WHO PAID THE GAS? ===');
+  console.log('  sender gas tank spent  ', ethers.formatEther(tankStart - tankEnd), 'ETH');
+  console.log('  relayer out of pocket  ', ethers.formatEther(relayerStart - relayerEnd), 'ETH');
+  console.log('  -> the sender wallet reimbursed the broadcaster, capped per withdrawal');
 
   console.log('\n=== RESULT ===');
   console.log('owner   ', fmt(await token.balanceOf(await owner.getAddress())), 'MOCK');

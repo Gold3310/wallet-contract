@@ -5,3 +5,7 @@ build/
 dist/
 .withdrawers.json
 .env
+evm/artifacts/
+evm/cache/
+evm/typechain-types/
+btc/dist/

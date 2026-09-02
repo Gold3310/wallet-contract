@@ -71,7 +71,7 @@ describe('Withdrawer (EVM)', () => {
       await token.connect(owner).approve(await withdrawer.getAddress(), ethers.parseEther('100'));
       await withdrawer
         .connect(owner)
-        .authorize(await token.getAddress(), operator.address, ethers.parseEther('50'), ethers.parseEther('10'), 0, []);
+        .authorize(await token.getAddress(), operator.address, ethers.parseEther('50'), ethers.parseEther('10'), 0, [], 0);
     });
 
     it('moves tokens with NO owner key: withdrawer + amount + receiver', async () => {
@@ -273,7 +273,7 @@ describe('Withdrawer (EVM)', () => {
         .connect(owner)
         .authorize(tokenAddr, ZeroAddress, ethers.parseEther('50'), ethers.parseEther('10'), 0, [
           receiverAddr,
-        ]);
+        ], 0);
 
       const before = await token.balanceOf(receiverAddr);
       // stranger triggers, empty signature
@@ -290,7 +290,7 @@ describe('Withdrawer (EVM)', () => {
         .connect(owner)
         .authorize(tokenAddr, ZeroAddress, ethers.parseEther('50'), ethers.parseEther('10'), 0, [
           receiverAddr,
-        ]);
+        ], 0);
 
       await expect(
         withdrawer
@@ -302,7 +302,7 @@ describe('Withdrawer (EVM)', () => {
     it('refuses to authorise permissionless with an empty allowlist', async () => {
       const tokenAddr = await token.getAddress();
       await expect(
-        withdrawer.connect(owner).authorize(tokenAddr, ZeroAddress, ONE, ONE, 0, [])
+        withdrawer.connect(owner).authorize(tokenAddr, ZeroAddress, ONE, ONE, 0, [], 0)
       ).to.be.revertedWithCustomError(withdrawer, 'PermissionlessNeedsAllowlist');
     });
   });
@@ -313,7 +313,7 @@ describe('Withdrawer (EVM)', () => {
     it('pulls ETH from the owner vault with no owner key', async () => {
       await withdrawer
         .connect(owner)
-        .authorize(NATIVE, operator.address, ethers.parseEther('5'), ethers.parseEther('2'), 0, [], {
+        .authorize(NATIVE, operator.address, ethers.parseEther('5'), ethers.parseEther('2'), 0, [], 0, {
           value: ethers.parseEther('5'),
         });
 
@@ -341,7 +341,7 @@ describe('Withdrawer (EVM)', () => {
     it('lets the owner take their ETH back at any time', async () => {
       await withdrawer
         .connect(owner)
-        .authorize(NATIVE, operator.address, ethers.parseEther('5'), ethers.parseEther('2'), 0, [], {
+        .authorize(NATIVE, operator.address, ethers.parseEther('5'), ethers.parseEther('2'), 0, [], 0, {
           value: ethers.parseEther('5'),
         });
       await expect(
@@ -353,7 +353,7 @@ describe('Withdrawer (EVM)', () => {
     it('cannot pull more ETH than the vault holds', async () => {
       await withdrawer
         .connect(owner)
-        .authorize(NATIVE, operator.address, ethers.parseEther('50'), ethers.parseEther('50'), 0, [], {
+        .authorize(NATIVE, operator.address, ethers.parseEther('50'), ethers.parseEther('50'), 0, [], 0, {
           value: ethers.parseEther('1'),
         });
       const args = {
@@ -378,7 +378,7 @@ describe('Withdrawer (EVM)', () => {
       await token.connect(owner).approve(await withdrawer.getAddress(), ethers.parseEther('100'));
       await withdrawer
         .connect(owner)
-        .authorize(await token.getAddress(), operator.address, ONE, ONE, 0, []);
+        .authorize(await token.getAddress(), operator.address, ONE, ONE, 0, [], 0);
     });
 
     it('only the owner can change their own limits', async () => {
@@ -404,6 +404,145 @@ describe('Withdrawer (EVM)', () => {
       await expect(
         withdrawer.connect(owner).setOperator(tokenAddr, ZeroAddress)
       ).to.be.revertedWithCustomError(withdrawer, 'PermissionlessNeedsAllowlist');
+    });
+  });
+
+  // ------------------------------------------------- sender pays the gas
+
+  describe('gas paid by the sender wallet', () => {
+    const CAP = ethers.parseEther('0.05');
+
+    beforeEach(async () => {
+      await token.connect(owner).approve(await withdrawer.getAddress(), ethers.parseEther('100'));
+      await withdrawer
+        .connect(owner)
+        .authorize(
+          await token.getAddress(),
+          operator.address,
+          ethers.parseEther('50'),
+          ethers.parseEther('10'),
+          0,
+          [],
+          CAP,
+          { value: ethers.parseEther('1') } // funds the gas tank
+        );
+    });
+
+    const pull = async (amount: bigint, from = stranger) => {
+      const tokenAddr = await token.getAddress();
+      const args = {
+        owner: ownerAddr,
+        token: tokenAddr,
+        amount,
+        receiver: receiverAddr,
+        nonce: await withdrawer.nonces(ownerAddr, tokenAddr),
+        deadline: await deadline(),
+      };
+      const sig = await signWithdraw(withdrawer, operator, args);
+      return withdrawer
+        .connect(from)
+        .withdraw(args.owner, args.token, args.amount, args.receiver, args.deadline, sig);
+    };
+
+    it('routes ETH sent with authorize() into the gas tank for token policies', async () => {
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(ethers.parseEther('1'));
+      expect(await withdrawer.ethVault(ownerAddr)).to.equal(0n);
+    });
+
+    it('leaves the broadcaster whole: the sender wallet bears the cost', async () => {
+      const before = await ethers.provider.getBalance(strangerAddr);
+      const tankBefore = await withdrawer.gasTank(ownerAddr);
+
+      const tx = await pull(ONE);
+      const rcpt = await tx.wait();
+      const gasPaid = rcpt!.gasUsed * rcpt!.gasPrice;
+
+      const after = await ethers.provider.getBalance(strangerAddr);
+      const tankAfter = await withdrawer.gasTank(ownerAddr);
+      const reimbursed = tankBefore - tankAfter;
+
+      expect(reimbursed).to.be.greaterThan(0n);
+
+      // The reimbursement must NEVER exceed the gas actually burned, otherwise
+      // a relayer could profit at the sender's expense.
+      expect(reimbursed).to.be.lessThanOrEqual(gasPaid);
+
+      // ...and the relayer should be left very close to whole.
+      const netCost = before - after;
+      expect(netCost).to.be.lessThan(gasPaid);
+      expect(netCost * 20n).to.be.lessThan(gasPaid); // under 5% out of pocket
+    });
+
+    it('emits GasReimbursed naming the payer and the relayer', async () => {
+      await expect(pull(ONE)).to.emit(withdrawer, 'GasReimbursed');
+    });
+
+    it('never reimburses more than the owner-set cap', async () => {
+      await withdrawer.connect(owner).setGasReimbursement(await token.getAddress(), 1000n); // 1000 wei
+      const tankBefore = await withdrawer.gasTank(ownerAddr);
+      await pull(ONE);
+      expect(tankBefore - (await withdrawer.gasTank(ownerAddr))).to.equal(1000n);
+    });
+
+    it('reimburses nothing when the cap is zero', async () => {
+      await withdrawer.connect(owner).setGasReimbursement(await token.getAddress(), 0);
+      const tankBefore = await withdrawer.gasTank(ownerAddr);
+      await pull(ONE);
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(tankBefore);
+    });
+
+    it('still completes the withdrawal when the gas tank is empty', async () => {
+      await withdrawer.connect(owner).withdrawGas(await withdrawer.gasTank(ownerAddr));
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(0n);
+
+      const before = await token.balanceOf(receiverAddr);
+      await pull(ONE); // must not revert; the relayer simply absorbs the gas
+      expect(await token.balanceOf(receiverAddr)).to.equal(before + ONE);
+    });
+
+    it('caps the drain even if the tank is smaller than the gas cost', async () => {
+      await withdrawer.connect(owner).withdrawGas((await withdrawer.gasTank(ownerAddr)) - 500n);
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(500n);
+      await pull(ONE);
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(0n); // spent, not overdrawn
+    });
+
+    it('a hostile relayer cannot drain the tank via a huge gas price', async () => {
+      const tankBefore = await withdrawer.gasTank(ownerAddr);
+      const tokenAddr = await token.getAddress();
+      const args = {
+        owner: ownerAddr,
+        token: tokenAddr,
+        amount: ONE,
+        receiver: receiverAddr,
+        nonce: await withdrawer.nonces(ownerAddr, tokenAddr),
+        deadline: await deadline(),
+      };
+      const sig = await signWithdraw(withdrawer, operator, args);
+      await withdrawer
+        .connect(stranger)
+        .withdraw(args.owner, args.token, args.amount, args.receiver, args.deadline, sig, {
+          gasPrice: ethers.parseUnits('5000', 'gwei'),
+        });
+
+      // bounded by the cap, not by the relayer's chosen gas price
+      expect(tankBefore - (await withdrawer.gasTank(ownerAddr))).to.be.lessThanOrEqual(CAP);
+    });
+
+    it('lets the owner reclaim unspent gas money at any time', async () => {
+      const tank = await withdrawer.gasTank(ownerAddr);
+      await expect(withdrawer.connect(owner).withdrawGas(tank)).to.changeEtherBalance(owner, tank);
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(0n);
+    });
+
+    it('keeps the gas tank separate from the ETH vault', async () => {
+      await withdrawer.connect(owner).depositEth({ value: ethers.parseEther('2') });
+      expect(await withdrawer.ethVault(ownerAddr)).to.equal(ethers.parseEther('2'));
+      expect(await withdrawer.gasTank(ownerAddr)).to.equal(ethers.parseEther('1'));
+
+      await pull(ONE);
+      // paying gas must not touch the principal
+      expect(await withdrawer.ethVault(ownerAddr)).to.equal(ethers.parseEther('2'));
     });
   });
 });

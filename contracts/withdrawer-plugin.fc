@@ -71,10 +71,18 @@ int gas_to_coins(int workchain, int gas) inline_ref {
   return (gas * gas_price) >> 16;
 }
 
+;; THE SENDER WALLET PAYS ALL GAS.
+;; The plugin fronts the gas for the request leg out of its own balance, then
+;; asks the wallet for `amount + fee::forward`, which is sized to reimburse
+;; that outlay as well as the external-message gas, the payout leg and the
+;; forward fee. The plugin therefore never drains: its balance is flat-to-
+;; slightly-positive across withdrawals, and whatever accumulates goes back to
+;; the wallet on revoke. Verified by the "sender wallet pays all gas" test.
+;;
 ;; Value attached to the "plug" request (must cover the wallet's own gas).
 int fee::request(int wc) inline { return gas_to_coins(wc, 15000) + short_msg_fwd_fee(wc); }
 ;; Extra requested on top of `amount` so the payout to the receiver is exact.
-int fee::forward(int wc) inline { return gas_to_coins(wc, 15000) + (short_msg_fwd_fee(wc) * 2); }
+int fee::forward(int wc) inline { return gas_to_coins(wc, 30000) + (short_msg_fwd_fee(wc) * 2); }
 
 ;; ------------------------------------------------------------------- errors
 ;; 30 bad signature            33 bad seqno            34 expired

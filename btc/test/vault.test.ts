@@ -216,4 +216,67 @@ describe('Bitcoin pre-signed vault', () => {
     expect(w.input.value - inspectPresigned(w, 'regtest').amount).to.equal(w.feeSats);
     expect(inspectPresigned(w, 'regtest').amount).to.equal(100_000);
   });
+
+  it('the SENDER pays every satoshi of fees; receivers are credited in full', () => {
+    const owner = makeOwner();
+    const alice = randomAddress();
+    const bob = randomAddress();
+    const FUNDING = 1_000_000;
+    const plan = [
+      { amount: 100_000, receiver: alice },
+      { amount: 250_000, receiver: bob },
+    ];
+
+    const vault = createVault({
+      ownerKey: owner.key,
+      utxo: fakeUtxo(owner.address, FUNDING),
+      plan,
+      feeRate: 7,
+      network: 'regtest',
+    });
+
+    // Every receiver gets the full planned amount, never net of a fee.
+    let delivered = 0;
+    let withdrawalFees = 0;
+    for (const w of vault.withdrawals) {
+      const seen = inspectPresigned(w, 'regtest');
+      const planned = plan.find((x) => x.receiver === seen.receiver)!;
+      expect(seen.amount).to.equal(planned.amount);
+      delivered += seen.amount;
+      withdrawalFees += w.feeSats;
+    }
+    expect(delivered).to.equal(350_000);
+
+    // Full accounting: the funding UTXO covers payouts + every fee + change,
+    // and the fees come out of the sender's side, never the receivers'.
+    const splitTx = bitcoin.Transaction.fromHex(vault.splitTxHex);
+    const splitOutTotal = splitTx.outs.reduce((a, o) => a + o.value, 0);
+    const splitFee = FUNDING - splitOutTotal;
+
+    expect(delivered + withdrawalFees + splitFee + vault.changeSats).to.equal(FUNDING);
+    expect(splitFee).to.be.greaterThan(0);
+    expect(withdrawalFees).to.be.greaterThan(0);
+  });
+
+  it('broadcasting a pre-signed withdrawal costs the broadcaster nothing', () => {
+    const owner = makeOwner();
+    const alice = randomAddress();
+    const vault = createVault({
+      ownerKey: owner.key,
+      utxo: fakeUtxo(owner.address, 1_000_000),
+      plan: [{ amount: 100_000, receiver: alice }],
+      feeRate: 7,
+      network: 'regtest',
+    });
+
+    const w = vault.withdrawals[0];
+    const tx = bitcoin.Transaction.fromHex(w.txHex);
+
+    // The transaction is self-contained: one input the sender already funded,
+    // one output to the receiver. The miner fee is the difference, which the
+    // sender pre-paid into the bucket. A broadcaster adds no input of its own.
+    expect(tx.ins).to.have.length(1);
+    expect(tx.outs).to.have.length(1);
+    expect(w.input.value - tx.outs[0].value).to.equal(w.feeSats);
+  });
 });

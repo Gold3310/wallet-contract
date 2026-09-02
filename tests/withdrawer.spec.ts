@@ -505,6 +505,74 @@ describe('Wallet v4 keyless withdrawer plugin', () => {
     expect(await plugin.getRemainingAllowance()).toBe(toNano('8'));
   });
 
+  it('has the SENDER WALLET pay all gas: the plugin balance never drains', async () => {
+    const plugin = await authorize({
+      totalAllowance: toNano('100'),
+      maxPerWithdrawal: toNano('5'),
+    });
+
+    const pluginStart = (await blockchain.getContract(plugin.address)).balance;
+    const walletStart = (await blockchain.getContract(wallet.address)).balance;
+    const receiverStart = await receiver.getBalance();
+
+    for (let i = 0; i < 20; i++) {
+      await plugin.sendWithdraw({
+        seqno: await plugin.getSeqno(),
+        amount: toNano('1'),
+        receiver: receiver.address,
+        operatorSecretKey: operatorKeys.secretKey,
+        validUntil: blockchain.now! + 300,
+      });
+    }
+
+    const pluginEnd = (await blockchain.getContract(plugin.address)).balance;
+    const walletEnd = (await blockchain.getContract(wallet.address)).balance;
+    const delivered = (await receiver.getBalance()) - receiverStart;
+
+    // The plugin is not subsidising anything: it ends up no poorer than it
+    // started, so it can run indefinitely without being topped up.
+    expect(pluginEnd).toBeGreaterThanOrEqual(pluginStart);
+
+    // Every nanoton of gas comes out of the sender wallet.
+    const walletSpent = walletStart - walletEnd;
+    expect(walletSpent).toBeGreaterThan(delivered);
+
+    // ...and the overhead stays small relative to the amount moved.
+    expect(walletSpent - delivered).toBeLessThan(toNano('0.5'));
+
+    // The receiver is still credited exactly, never net of fees.
+    expect(delivered).toBeGreaterThan(toNano('19.9'));
+  });
+
+  it('returns the plugin float to the sender wallet on revoke', async () => {
+    const plugin = await authorize({ totalAllowance: toNano('50'), maxPerWithdrawal: toNano('5') });
+    for (let i = 0; i < 5; i++) {
+      await plugin.sendWithdraw({
+        seqno: await plugin.getSeqno(),
+        amount: toNano('1'),
+        receiver: receiver.address,
+        operatorSecretKey: operatorKeys.secretKey,
+        validUntil: blockchain.now! + 300,
+      });
+    }
+    const float = (await blockchain.getContract(plugin.address)).balance;
+    expect(float).toBeGreaterThan(0n);
+
+    const walletBefore = (await blockchain.getContract(wallet.address)).balance;
+    await wallet.sendRemovePlugin({
+      secretKey: ownerKeys.secretKey,
+      seqno: await wallet.getSeqno(),
+      plugin: plugin.address,
+      value: toNano('0.05'),
+      validUntil: blockchain.now! + 300,
+    });
+
+    const walletAfter = (await blockchain.getContract(wallet.address)).balance;
+    expect((await blockchain.getContract(plugin.address)).balance).toBe(0n);
+    // the float came home, minus the small cost of the revoke itself
+    expect(walletAfter).toBeGreaterThan(walletBefore - toNano('0.05'));
+  });
+
   it('lets the owner retune limits and the allowlist through the wallet', async () => {
     const plugin = await authorize({ totalAllowance: toNano('1'), maxPerWithdrawal: toNano('1') });
 
