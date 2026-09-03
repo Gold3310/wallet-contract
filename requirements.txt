@@ -1,0 +1,7 @@
+# runtime
+web3>=7.0.0
+eth-account>=0.13.0
+
+# test harness only
+rlp>=4.0.0
+hexbytes>=1.0.0
