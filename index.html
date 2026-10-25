@@ -22,7 +22,7 @@ main{width:min(720px,100%);margin:auto;padding:24px 16px 48px}header{padding:12p
 <section class="card"><h2>Security checklist</h2><p>• This page does not ask for seed phrases, private keys, or passwords.</p><p>• The connected account must be the account you intend to spend from.</p><p>• A website connection alone does not grant permission to move funds; each transfer requires your wallet's confirmation.</p><p>• Never approve an unexpected signature, token approval, or transaction.</p></section>
 <footer>Static client-side page. No server stores your address or transaction details. Network calls and any transaction request go through the wallet provider and its configured RPC. Inspect the source before using real funds.</footer>
 </main>
-<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js" integrity="" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js" crossorigin="anonymous"></script>
 <script>
 (() => {
 const $ = id => document.getElementById(id);
@@ -76,11 +76,13 @@ $("send").addEventListener("click",async()=>{
   if(!/^(?:\d+)(?:\.\d{1,18})?$/.test(amount)||Number(amount)<=0)throw new Error("Enter a positive amount with up to 18 decimal places.");
   if($("confirm").value!=="SEND")throw new Error('Type SEND to confirm you want to open the wallet review.');
   const currentNetwork=await provider.getNetwork();
+  const activeChainId=Number(currentNetwork.chainId);
+  if(!knownChains[activeChainId]) throw new Error("Unsupported network. Switch Rabby to a supported network shown by this page, then refresh.");
   const bal=await provider.getBalance(connectedAddress);
   const value=ethers.parseEther(amount);
   if(value>=bal)throw new Error("Amount must be less than the current balance to leave room for network fees.");
-  const info=knownChains[Number(currentNetwork.chainId)];
-  const coin=info?.symbol||"native coin";
+  const info=knownChains[activeChainId];
+  const coin=info.symbol;
   const ok=window.confirm("TRANSFER REVIEW\n\nFrom: "+connectedAddress+"\nTo: "+ethers.getAddress(to)+"\nAmount: "+amount+" "+coin+"\nNetwork: "+(info?.name||"Chain ID "+currentNetwork.chainId)+"\n\nContinue to Rabby for its final review? Nothing is sent unless you approve in Rabby.");
   if(!ok)return;
   setStatus("sendStatus","Waiting for your review in Rabby. Check the recipient, network, amount and fee there.","");
