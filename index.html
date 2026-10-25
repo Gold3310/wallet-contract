@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101827"><title>Rabby Wallet Desk</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--card:#131e30;--line:#29384e;--text:#f2f6ff;--muted:#9eacc2;--accent:#9be15d;--warn:#ffd37a;--danger:#ff9b9b}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#142238,var(--bg) 45%);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+main{width:min(720px,100%);margin:auto;padding:24px 16px 48px}header{padding:12px 0 22px}h1{font-size:clamp(1.7rem,6vw,2.4rem);margin:0 0 6px}p{margin:8px 0;color:var(--muted)}.tag{display:inline-block;border:1px solid #43536c;border-radius:99px;padding:4px 10px;font-size:.78rem;color:var(--accent)}
+.card{background:rgba(19,30,48,.96);border:1px solid var(--line);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 10px 30px #0002}h2{font-size:1.12rem;margin:0 0 10px}label{display:block;font-weight:600;margin:13px 0 5px}input,select,button{width:100%;border-radius:11px;padding:13px 12px;font:inherit}input,select{background:#0a1322;color:var(--text);border:1px solid #3a4a62;min-width:0}button{border:0;background:var(--accent);color:#13210d;font-weight:750;margin-top:12px;cursor:pointer}button.secondary{background:#27364b;color:var(--text);border:1px solid #3a4a62}button:disabled{opacity:.55;cursor:not-allowed}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.status{padding:11px 12px;border-radius:10px;background:#0a1322;color:var(--muted);overflow-wrap:anywhere;margin-top:10px}.good{color:var(--accent)}.error{color:var(--danger)}.warning{border-left:3px solid var(--warn);padding:8px 12px;background:#332a19;color:#ffe3aa;border-radius:0 8px 8px 0;font-size:.92rem}.mono{font: .88rem ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}.small{font-size:.85rem}.hidden{display:none}footer{font-size:.82rem;color:var(--muted);padding:14px 2px}
+</style>
+</head>
+<body><main>
+<header><span class="tag">SELF-CUSTODY · USER-APPROVED</span><h1>Rabby Wallet Desk</h1><p>Connect your wallet, inspect the current account, and prepare a native-coin transfer that Rabby must review and approve.</p></header>
+<section class="card"><h2>1. Connect wallet</h2><p>Only a public address and current network are read. No connection is attempted until you press the button.</p><button id="connect">Connect Rabby</button><div class="status" id="connection" role="status">Not connected.</div><div id="accountDetails" class="hidden"><label>Connected address</label><div id="address" class="mono"></div><div class="row"><div><label>Network</label><div id="network" class="status">—</div></div><div><label>Native balance</label><div id="balance" class="status">—</div></div></div><button id="refresh" class="secondary">Refresh account</button><button id="disconnect" class="secondary">Disconnect this page</button></div></section>
+<section class="card"><h2>2. Send native coin</h2><div class="warning">Sending cryptocurrency can be irreversible. Confirm the recipient, network, amount, and fee in Rabby. This page never sends automatically and cannot bypass wallet approval. Start with a small test transfer; do not send funds to an address you have not independently verified.</div>
+<label for="to">Recipient public address</label><input id="to" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x…">
+<div class="row"><div><label for="amount">Amount</label><input id="amount" inputmode="decimal" autocomplete="off" placeholder="0.001"></div><div><label for="asset">Native asset</label><input id="asset" disabled value="Detected from network"></div></div>
+<label for="confirm">Type SEND to enable transfer</label><input id="confirm" autocomplete="off" placeholder="SEND">
+<button id="send" disabled>Review & send in Rabby</button><div class="status" id="sendStatus" role="status">Connect a wallet first. Token transfers are not included in this version.</div>
+</section>
+<section class="card"><h2>Security checklist</h2><p>• This page does not ask for seed phrases, private keys, or passwords.</p><p>• The connected account must be the account you intend to spend from.</p><p>• A website connection alone does not grant permission to move funds; each transfer requires your wallet's confirmation.</p><p>• Never approve an unexpected signature, token approval, or transaction.</p></section>
+<footer>Static client-side page. No server stores your address or transaction details. Network calls and any transaction request go through the wallet provider and its configured RPC. Inspect the source before using real funds.</footer>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js" integrity="" crossorigin="anonymous"></script>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+let provider, signer, connectedAddress, chainId;
+const knownChains = {
+  1:{name:"Ethereum Mainnet",symbol:"ETH"}, 8453:{name:"Base",symbol:"ETH"},
+  42161:{name:"Arbitrum One",symbol:"ETH"}, 10:{name:"Optimism",symbol:"ETH"},
+  137:{name:"Polygon",symbol:"POL"}, 56:{name:"BNB Smart Chain",symbol:"BNB"},
+  11155111:{name:"Sepolia Testnet",symbol:"ETH"}, 84532:{name:"Base Sepolia",symbol:"ETH"}
+};
+function setStatus(id,msg,cls=""){ $(id).textContent=msg; $(id).className="status "+cls; }
+function validAddress(s){ try{return ethers.isAddress(s)}catch{return false} }
+function updateSendButton(){ $("send").disabled=!(provider && connectedAddress && validAddress($("to").value.trim()) && Number.isFinite(Number($("amount").value)) && Number($("amount").value)>0 && $("confirm").value==="SEND"); }
+async function refresh(){
+ if(!provider||!connectedAddress)return;
+ const network=await provider.getNetwork(); chainId=Number(network.chainId);
+ const info=knownChains[chainId];
+ $("address").textContent=connectedAddress;
+ $("network").textContent=(info?.name||"Unknown EVM network")+" (chain "+chainId+")";
+ $("asset").value=info?.symbol||"Native coin";
+ const b=await provider.getBalance(connectedAddress);
+ $("balance").textContent=Number(ethers.formatEther(b)).toLocaleString(undefined,{maximumFractionDigits:8})+" "+(info?.symbol||"native");
+ $("accountDetails").classList.remove("hidden");
+ setStatus("connection","Connected: "+connectedAddress,"good");
+ updateSendButton();
+}
+async function connect(){
+ if(!window.ethereum){setStatus("connection","No injected wallet provider detected. Open this page in a browser that exposes Rabby, then try again.","error");return;}
+ try{
+  let chosen=window.ethereum;
+  const providers=window.ethereum.providers||[];
+  chosen=providers.find(p=>p.isRabby)||window.ethereum;
+  provider=new ethers.BrowserProvider(chosen);
+  const accounts=await chosen.request({method:"eth_requestAccounts"});
+  if(!accounts||!accounts.length)throw new Error("No account was authorized.");
+  connectedAddress=ethers.getAddress(accounts[0]);
+  signer=await provider.getSigner();
+  await refresh();
+ }catch(e){setStatus("connection",e?.shortMessage||e?.message||"Connection cancelled.","error");}
+}
+$("connect").addEventListener("click",connect);
+$("refresh").addEventListener("click",()=>refresh().catch(e=>setStatus("connection",e.message,"error")));
+$("disconnect").addEventListener("click",()=>{provider=null;signer=null;connectedAddress=null;chainId=null;$("accountDetails").classList.add("hidden");setStatus("connection","Disconnected from this page. To revoke site permissions, use Rabby settings.");updateSendButton();});
+["to","amount","confirm"].forEach(id=>$(id).addEventListener("input",updateSendButton));
+$("send").addEventListener("click",async()=>{
+ try{
+  if(!provider||!signer||!connectedAddress)throw new Error("Connect your wallet first.");
+  const to=$("to").value.trim(), amount=$("amount").value.trim();
+  if(!validAddress(to))throw new Error("Enter a valid EVM recipient address.");
+  if(ethers.getAddress(to)===connectedAddress)throw new Error("Recipient is the same as the connected account.");
+  if(!/^(?:\d+)(?:\.\d{1,18})?$/.test(amount)||Number(amount)<=0)throw new Error("Enter a positive amount with up to 18 decimal places.");
+  if($("confirm").value!=="SEND")throw new Error('Type SEND to confirm you want to open the wallet review.');
+  const currentNetwork=await provider.getNetwork();
+  const bal=await provider.getBalance(connectedAddress);
+  const value=ethers.parseEther(amount);
+  if(value>=bal)throw new Error("Amount must be less than the current balance to leave room for network fees.");
+  const info=knownChains[Number(currentNetwork.chainId)];
+  const coin=info?.symbol||"native coin";
+  const ok=window.confirm("TRANSFER REVIEW\n\nFrom: "+connectedAddress+"\nTo: "+ethers.getAddress(to)+"\nAmount: "+amount+" "+coin+"\nNetwork: "+(info?.name||"Chain ID "+currentNetwork.chainId)+"\n\nContinue to Rabby for its final review? Nothing is sent unless you approve in Rabby.");
+  if(!ok)return;
+  setStatus("sendStatus","Waiting for your review in Rabby. Check the recipient, network, amount and fee there.","");
+  const tx=await signer.sendTransaction({to:ethers.getAddress(to),value});
+  setStatus("sendStatus","Transaction submitted. Hash: "+tx.hash+" — waiting for confirmation.","");
+  await tx.wait();
+  setStatus("sendStatus","Transaction confirmed. Hash: "+tx.hash,"good");
+  await refresh();
+ }catch(e){setStatus("sendStatus",e?.shortMessage||e?.message||"Transfer cancelled or failed.","error");}
+});
+if(window.ethereum){
+ window.ethereum.on?.("accountsChanged",accounts=>{if(!accounts?.length){connectedAddress=null;signer=null;provider=null;$("accountDetails").classList.add("hidden");setStatus("connection","Wallet disconnected.");updateSendButton();}else{connect();}});
+ window.ethereum.on?.("chainChanged",()=>{if(provider&&connectedAddress)refresh().catch(e=>setStatus("connection",e.message,"error"));});
+}
+})();
+</script>
+</body></html>
